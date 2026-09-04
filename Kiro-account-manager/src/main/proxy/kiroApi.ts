@@ -167,28 +167,15 @@ const KIRO_ENDPOINTS = [
   }
 ]
 
-// Kiro 版本号（跟随官方 IDE 更新）
-const KIRO_VERSION = '0.12.155'
-const AWS_SDK_VERSION = '1.0.34'
-const AWS_STREAMING_API_VERSION = '1.0.34'
-
-const OS_PLATFORM = process.platform === 'win32' ? 'win32' : process.platform === 'darwin' ? 'macos' : 'linux'
-const OS_RELEASE = (() => { try { return require('os').release() } catch { return '10.0.0' } })()
-const NODE_VERSION = process.versions.node || '22.22.0'
-
-function getKiroUserAgent(machineId?: string): string {
-  const suffix = machineId ? `KiroIDE-${KIRO_VERSION}-${machineId}` : `KiroIDE-${KIRO_VERSION}`
-  return `aws-sdk-js/${AWS_SDK_VERSION} ua/2.1 os/${OS_PLATFORM}#${OS_RELEASE} lang/js md/nodejs#${NODE_VERSION} api/codewhispererstreaming#${AWS_STREAMING_API_VERSION} m/E ${suffix}`
-}
-
-function getKiroAmzUserAgent(machineId?: string): string {
-  const suffix = machineId ? `KiroIDE ${KIRO_VERSION} ${machineId}` : `KiroIDE-${KIRO_VERSION}`
-  return `aws-sdk-js/${AWS_SDK_VERSION} ${suffix}`
-}
-
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-const KIRO_CLI_OS = OS_PLATFORM === 'win32' ? 'windows' : OS_PLATFORM === 'macos' ? 'macos' : 'linux'
-void KIRO_CLI_OS // reserved for future kiro-cli UA
+// UA 与版本号统一由 ../kiroEndpoints 提供，反代与账号管理器共用同一份，
+// 避免两侧版本号漂移（服务端会按 UA 里的版本号对 Builder ID / IdC 做准入）。
+import {
+  KIRO_IDE_VERSION,
+  getKiroUserAgent,
+  getKiroAmzUserAgent,
+  qServiceEndpoint,
+  codeWhispererEndpoint
+} from '../kiroEndpoints'
 
 // Agent 模式（可通过 setAgentMode 配置切换）
 let configuredAgentMode: 'vibe' | 'spec' = 'vibe'
@@ -206,31 +193,23 @@ import {
   KIRO_BUILDER_ID_PLACEHOLDER_ARN as _KIRO_BUILDER_ID_PLACEHOLDER_ARN,
   KIRO_SOCIAL_PROFILE_ARN,
   isPlaceholderProfileArn as _isPlaceholderProfileArn,
-  getEnterpriseFallbackArn
+  isEnterpriseLogin,
+  profileArnCandidates,
+  isProfileArnRejection
 } from '../kiroAuthSync'
 
 export const KIRO_BUILDER_ID_PLACEHOLDER_ARN = _KIRO_BUILDER_ID_PLACEHOLDER_ARN
 export const isPlaceholderProfileArn = _isPlaceholderProfileArn
 
 /**
- * 反代调 Kiro API 时使用的 profileArn 决策。
- * 优先级：真实 ARN（自动获取） > 备用固定 ARN（按账号类型）
- * - 已有真实 ARN（非占位符） → 直接用
- * - Enterprise/IdC → 区域化备用 ARN（自动获取失败时兜底）
+ * 反代调 Kiro API 时使用的 profileArn 决策（取候选里的第一个）。
+ * 优先级：账号已存的真实 ARN > 按登录方式的固定值
  * - Social（Github/Google） → 固定 social ARN
- * - BuilderId → 占位符 ARN
+ * - Enterprise/IdC → 区域化备用 ARN（真实 ARN 由 fetchEnterpriseProfileArn 自愈写回账号）
+ * - BuilderId → 占位符 ARN（该接口必填，不带就 403）
  */
 function resolveProfileArn(account: ProxyAccount): string | undefined {
-  if (account.profileArn && !isPlaceholderProfileArn(account.profileArn)) {
-    return account.profileArn
-  }
-  if (account.provider === 'Enterprise' || account.authMethod === 'external_idp') {
-    return getEnterpriseFallbackArn(account.region)
-  }
-  if (account.authMethod === 'social' || account.provider === 'Github' || account.provider === 'Google') {
-    return KIRO_SOCIAL_PROFILE_ARN
-  }
-  return KIRO_BUILDER_ID_PLACEHOLDER_ARN
+  return profileArnCandidates(account).find((arn): arn is string => !!arn)
 }
 
 // 兼容 SDK 部分调用仍想知道社交 ARN 的场景（极少；保留 export 不破坏外部 import）
@@ -1243,12 +1222,11 @@ export async function callKiroApiStream(
   signal?: AbortSignal,
   preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
 ): Promise<void> {
-  const isEnterprise = account.provider === 'Enterprise' || account.authMethod === 'external_idp'
   // 所有账号类型均走正常端点优先级（含 fallback），不再强制 Enterprise 走 CodeWhisperer
   const endpoints = getSortedEndpoints(preferredEndpoint)
 
-  // Enterprise 缺 profileArn 时调 API 获取；BuilderId/Social 不需要（resolveProfileArn 会兜底，流式端点自动不传占位符）
-  if (!account.profileArn && isEnterprise) {
+  // Enterprise 缺 profileArn 时调 API 获取；BuilderId/Social 不需要（resolveProfileArn 会按登录方式兜底）
+  if (!account.profileArn && isEnterpriseLogin(account)) {
     const fetchedArn = await fetchEnterpriseProfileArn(account)
     if (fetchedArn) {
       account.profileArn = fetchedArn
@@ -1358,9 +1336,11 @@ export async function callKiroApiStream(
               }
             }
           }
-          // 复用同一端点的配置（与主流程 profileArn 逻辑一致）
+          // 复用同一端点的配置（与主流程 profileArn 逻辑一致）。
+          // 注意别在这里剥掉占位符：对话接口已把 profileArn 当必填，
+          // Builder ID 恰恰要带占位符才回 200，剥掉就变成 400 "profileArn is required"。
           const resolvedArn2 = resolveProfileArn(account)
-          if (resolvedArn2 && (!isPlaceholderProfileArn(resolvedArn2) || isEnterprise)) {
+          if (resolvedArn2) {
             retryPayload.profileArn = resolvedArn2
           } else {
             delete retryPayload.profileArn
@@ -2236,22 +2216,19 @@ export interface KiroModel {
   availableOrigins?: string[] | null
 }
 
-// 根据账号区域获取 Q Service 端点（官方插件使用 q.{region}.amazonaws.com）
-function getQServiceEndpoint(region?: string): string {
-  if (region?.startsWith('eu-')) return 'https://q.eu-central-1.amazonaws.com'
-  return 'https://q.us-east-1.amazonaws.com'
-}
-
-// 根据账号区域获取 CodeWhisperer Runtime 端点
-function getCodeWhispererEndpoint(region?: string): string {
-  if (region?.startsWith('eu-')) return 'https://codewhisperer.eu-central-1.amazonaws.com'
-  return 'https://codewhisperer.us-east-1.amazonaws.com'
-}
+// 区域端点映射统一走 ../kiroEndpoints（q.{region} / codewhisperer.{region}）
+const getQServiceEndpoint = qServiceEndpoint
+const getCodeWhispererEndpoint = codeWhispererEndpoint
 
 /**
  * Enterprise 账号获取 profileArn（通过 CodeWhisperer Runtime 的 /ListAvailableProfiles）
  * 官方 IDE 在认证后通过此 API 获取可用 profiles，用户选择后存储 ARN。
  * 反代自动取第一个 profile。
+ *
+ * 只返回上游给出的真实 ARN。查不到时返回 undefined，兜底交给 profileArnCandidates——
+ * 此前这里在 403 时把兜底 ARN 当作「查到的结果」返回，调用方会把它持久化进账号，
+ * 而 Enterprise 的兜底 ARN 属于另一个组织，之后每次请求都拿别家 profile 去查，
+ * 上游回 403 "Invalid token"，且因为已持久化而不会再重查，等于把错误固化下来。
  */
 export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<string | undefined> {
   const baseUrl = getCodeWhispererEndpoint(account.region)
@@ -2267,9 +2244,6 @@ export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<
     'amz-sdk-request': 'attempt=1; max=1'
   }
 
-  // 获取该账号类型对应的备用 ARN（403 时兜底，避免每次请求都重复尝试）
-  const fallbackArn = resolveProfileArn(account)
-
   try {
     const response = await fetchWithProxy(url, {
       method: 'POST',
@@ -2279,12 +2253,10 @@ export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<
 
     if (!response.ok) {
       const errBody = await response.text().catch(() => '')
-      console.error(`[KiroAPI] ListAvailableProfiles failed: ${response.status}`, errBody.slice(0, 200))
-      // 403 = 无权限（BuilderId/Social 账号不支持此 API）→ 返回备用 ARN 作为缓存，不再重复尝试
-      if (response.status === 403 && fallbackArn) {
-        console.log(`[KiroAPI] Using fallback profileArn for ${account.provider || 'unknown'}: ${fallbackArn}`)
-        return fallbackArn
-      }
+      // 403 = 该登录方式不支持此 API（BuilderId / Social 没有 profile 概念），
+      // 属于预期结果而非故障，用 warn 记一笔即可
+      const log = response.status === 403 ? console.warn : console.error
+      log(`[KiroAPI] ListAvailableProfiles → ${response.status}`, errBody.slice(0, 200))
       return undefined
     }
 
@@ -2306,11 +2278,53 @@ export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<
   }
 }
 
-// 获取 Kiro 官方模型列表（支持分页，与官方插件一致传递 profileArn）
-export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
+/** 用一个确定的 profileArn 把 ListAvailableModels 的分页拉完 */
+async function fetchKiroModelsWithArn(
+  account: ProxyAccount,
+  profileArn: string | undefined,
+  headers: Record<string, string>,
+  signal?: AbortSignal
+): Promise<KiroModel[]> {
   const baseUrl = getQServiceEndpoint(account.region)
+  const models: KiroModel[] = []
+  let nextToken: string | undefined
+
+  do {
+    const params = new URLSearchParams({ origin: 'AI_EDITOR', maxResults: '50' })
+    if (profileArn) params.set('profileArn', profileArn)
+    if (nextToken) params.set('nextToken', nextToken)
+
+    const url = `${baseUrl}/ListAvailableModels?${params.toString()}`
+    throwIfAborted(signal)
+    const response = await fetchWithProxy(url, { method: 'GET', headers, signal }, account)
+    throwIfAborted(signal)
+
+    if (!response.ok) {
+      const errBody = await response.text().catch(() => '')
+      const err = new Error(`HTTP ${response.status}: ${errBody.slice(0, 300)}`) as Error & { status?: number }
+      err.status = response.status
+      throw err
+    }
+
+    const data = await response.json()
+    models.push(...(data.models || []))
+    nextToken = data.nextToken
+  } while (nextToken)
+
+  return models
+}
+
+/**
+ * 获取 Kiro 官方模型列表（支持分页，与官方插件一致传递 profileArn）。
+ *
+ * profileArn 给错会直接被拒（403 / 400 "Invalid profileArn"），所以按候选逐个实测：
+ * 账号已存的 ARN → Enterprise 的真实 profile → 按登录方式的默认值 → 不带。
+ * 只在 ARN 被拒时才换下一个，网络与 5xx 类错误换 ARN 也是同样结果，立即停。
+ * 实测生效的那个会写回账号并持久化，下次一次命中。
+ */
+export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
   const machineId = getAccountMachineId(account.id, account.machineId)
-  
+
   const headers: Record<string, string> = {
     'Authorization': `Bearer ${account.accessToken}`,
     'Content-Type': 'application/json',
@@ -2320,52 +2334,44 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
     'x-amzn-codewhisperer-optout': 'true'
   }
 
-  const allModels: KiroModel[] = []
-  let nextToken: string | undefined
-
-  // Enterprise 缺 profileArn 时调 API 获取；BuilderId/Social 不需要（resolveProfileArn 会兜底）
-  const isEnterprise = account.provider === 'Enterprise' || account.authMethod === 'external_idp'
-  if (!account.profileArn && isEnterprise) {
-    const fetchedArn = await fetchEnterpriseProfileArn(account)
-    if (fetchedArn) {
-      account.profileArn = fetchedArn
-      if (account.id) profileArnPersistCallback?.(account.id, fetchedArn)
+  // Enterprise 缺 profileArn 时先查真实 profile：内置兜底 ARN 属于另一个组织，
+  // 拿它查会被判 403 Invalid token，补错比不补更难排查
+  let resolvedEnterpriseArn: string | undefined
+  if (!account.profileArn && isEnterpriseLogin(account)) {
+    resolvedEnterpriseArn = await fetchEnterpriseProfileArn(account)
+    if (resolvedEnterpriseArn) {
+      account.profileArn = resolvedEnterpriseArn
+      if (account.id) profileArnPersistCallback?.(account.id, resolvedEnterpriseArn)
     }
   }
 
-  try {
-    do {
-      const params = new URLSearchParams({ origin: 'AI_EDITOR', maxResults: '50' })
-      const arnForModels = resolveProfileArn(account)
-      // profileArn 决策由 resolveProfileArn 统一处理：
-      //   - BuilderId → 占位符 ARN（ListAvailableModels 需要，有效）
-      //   - Github/Google → social ARN（有效）
-      //   - Enterprise → 真实 ARN（上方已自愈获取）
-      if (arnForModels) params.set('profileArn', arnForModels)
-      if (nextToken) params.set('nextToken', nextToken)
+  const candidates = profileArnCandidates(account, resolvedEnterpriseArn)
+  let lastError: unknown
 
-      const url = `${baseUrl}/ListAvailableModels?${params.toString()}`
-      throwIfAborted(signal)
-      const response = await fetchWithProxy(url, { method: 'GET', headers, signal }, account)
-      throwIfAborted(signal)
-      
-      if (!response.ok) {
-        const errBody = await response.text().catch(() => '')
-        console.error(`[KiroAPI] ListAvailableModels failed: ${response.status}`, errBody.slice(0, 300))
-        break
+  for (const candidate of candidates) {
+    try {
+      const models = await fetchKiroModelsWithArn(account, candidate, headers, signal)
+      if (models.length === 0) continue
+      // 实测生效的 ARN 写回账号：Enterprise 因此不必每轮都重查 ListAvailableProfiles
+      if (candidate && candidate !== account.profileArn && !isPlaceholderProfileArn(candidate)) {
+        account.profileArn = candidate
+        if (account.id) profileArnPersistCallback?.(account.id, candidate)
       }
-
-      const data = await response.json()
-      allModels.push(...(data.models || []))
-      nextToken = data.nextToken
-    } while (nextToken)
-
-    return allModels
-  } catch (error) {
-    if (signal?.aborted) throw getAbortError(signal)
-    console.error('[KiroAPI] ListAvailableModels error:', error)
-    return allModels.length > 0 ? allModels : []
+      return models
+    } catch (error) {
+      if (signal?.aborted) throw getAbortError(signal)
+      lastError = error
+      const msg = error instanceof Error ? error.message : String(error)
+      console.error(`[KiroAPI] ListAvailableModels failed (arn=${candidate ? 'set' : 'none'}):`, msg)
+      // 非 ARN 维度的失败（网络、5xx）换候选也没用
+      if (!isProfileArnRejection(msg)) break
+    }
   }
+
+  if (lastError) {
+    console.error('[KiroAPI] ListAvailableModels exhausted all profileArn candidates')
+  }
+  return []
 }
 
 // 订阅计划信息
@@ -2390,17 +2396,22 @@ export interface SubscriptionListResponse {
   subscriptionPlans?: SubscriptionPlan[]
 }
 
-// 订阅请求专用 User-Agent（匹配 Kiro IDE 实际报文格式）
-const KIRO_SUBSCRIPTION_VERSION = '0.12.155'
+// 订阅请求专用 User-Agent：走 codewhispererruntime 而非 codewhispererstreaming，
+// 这一点与对话链路不同，但版本号必须跟 KIRO_IDE_VERSION 一起动——服务端按版本号做准入。
+// os / node 指纹用本机真实值，不再固定写 win32#10.0.19043 + nodejs#22.22.0。
+const SUBSCRIPTION_API_VERSION = '1.0.0'
 
 function getSubscriptionUserAgent(machineId?: string): string {
-  const suffix = machineId ? `KiroIDE-${KIRO_SUBSCRIPTION_VERSION}-${machineId}` : `KiroIDE-${KIRO_SUBSCRIPTION_VERSION}`
-  return `aws-sdk-js/1.0.0 ua/2.1 os/win32#10.0.19043 lang/js md/nodejs#22.22.0 api/codewhispererruntime#1.0.0 m/N,E ${suffix}`
+  const suffix = machineId ? `KiroIDE-${KIRO_IDE_VERSION}-${machineId}` : `KiroIDE-${KIRO_IDE_VERSION}`
+  // 复用统一 UA 的 os/lang/md 段，只替换 api/ 与 m/ 两段，保持与 IDE 报文一致
+  const base = getKiroUserAgent()
+  const osSegment = base.slice(base.indexOf('ua/2.1'), base.indexOf(' api/'))
+  return `aws-sdk-js/${SUBSCRIPTION_API_VERSION} ${osSegment} api/codewhispererruntime#${SUBSCRIPTION_API_VERSION} m/N,E ${suffix}`
 }
 
 function getSubscriptionAmzUserAgent(machineId?: string): string {
-  const suffix = machineId ? `KiroIDE-${KIRO_SUBSCRIPTION_VERSION}-${machineId}` : `KiroIDE-${KIRO_SUBSCRIPTION_VERSION}`
-  return `aws-sdk-js/1.0.0 ${suffix}`
+  const suffix = machineId ? `KiroIDE-${KIRO_IDE_VERSION}-${machineId}` : `KiroIDE-${KIRO_IDE_VERSION}`
+  return `aws-sdk-js/${SUBSCRIPTION_API_VERSION} ${suffix}`
 }
 
 // 获取可用订阅列表

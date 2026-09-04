@@ -100,6 +100,8 @@ interface StatusResult {
     idp?: string // 身份提供商：BuilderId, Google, Github 等
     userStatus?: string // 用户状态：Active 等
     featureFlags?: string[] // 特性开关
+    /** 实测生效的 profileArn，写回账号后下次刷新一次命中 */
+    profileArn?: string
     subscriptionTitle?: string
     usage?: { 
       current: number
@@ -178,8 +180,11 @@ interface KiroApi {
       region?: string
       authMethod?: string
       provider?: string
+      profileArn?: string
     }
     idp?: string
+    profileArn?: string
+    machineId?: string
   }>, concurrency?: number) => Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }>
   onBackgroundCheckProgress: (callback: (data: { completed: number; total: number; success: number; failed: number }) => void) => () => void
   onBackgroundCheckResult: (callback: (data: { id: string; success: boolean; data?: unknown; error?: string }) => void) => () => void

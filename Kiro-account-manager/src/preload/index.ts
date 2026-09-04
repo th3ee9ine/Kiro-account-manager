@@ -98,8 +98,11 @@ const api = {
       region?: string
       authMethod?: string
       provider?: string
+      profileArn?: string
     }
     idp?: string
+    profileArn?: string
+    machineId?: string
   }>, concurrency?: number): Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }> => {
     return ipcRenderer.invoke('background-batch-check', accounts, concurrency)
   },

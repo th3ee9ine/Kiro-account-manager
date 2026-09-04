@@ -1512,6 +1512,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
               // 未知类型保持原值，不强制改为 Internal
             }
 
+            // 主进程实测生效的 profileArn：持久化后下次刷新一次命中，
+            // Enterprise 也不必每轮都重查 ListAvailableProfiles
+            const verifiedProfileArn = result.data!.profileArn || acc.profileArn
+
             accounts.set(id, {
               ...acc,
               // 更新邮箱（如果 API 返回了）
@@ -1522,6 +1526,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
               usage: mergedUsage,
               subscription: mergedSubscription as AccountSubscription,
               credentials: updatedCredentials,
+              ...(verifiedProfileArn ? { profileArn: verifiedProfileArn } : {}),
               lastCheckedAt: Date.now(),
               lastError: undefined
             })
@@ -1564,14 +1569,17 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         region?: string
         authMethod?: string
         provider?: string
+        profileArn?: string
       }
       idp?: string
+      profileArn?: string
+      machineId?: string
     }> = []
 
     for (const id of ids) {
       const account = accounts.get(id)
       if (!account?.credentials.accessToken) continue
-      
+
       accountsToCheck.push({
         id,
         email: account.email,
@@ -1582,9 +1590,13 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           clientSecret: account.credentials.clientSecret,
           region: account.credentials.region,
           authMethod: account.credentials.authMethod,
-          provider: account.credentials.provider
+          provider: account.credentials.provider,
+          profileArn: account.credentials.profileArn
         },
-        idp: account.idp
+        idp: account.idp,
+        // 用量接口要求带 profileArn：已存的传过去可一次命中，省掉主进程的候选试探
+        profileArn: account.profileArn,
+        machineId: account.machineId
       })
     }
 

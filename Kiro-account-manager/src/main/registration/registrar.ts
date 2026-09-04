@@ -18,6 +18,9 @@ import {
 } from './email-service'
 import { getSystemProxy, safeCreateProxyAgent } from '../proxy/systemProxy'
 import { redactString } from '../utils/redact'
+// 验活用量查询与账号管理器共用同一套 UA / 端点，避免版本号漂移导致 Builder ID 403
+import { getKiroUserAgent, getKiroAmzUserAgent, qServiceEndpoint } from '../kiroEndpoints'
+import { KIRO_BUILDER_ID_PLACEHOLDER_ARN } from '../kiroAuthSync'
 
 export type LogFn = (message: string) => void
 
@@ -1489,14 +1492,29 @@ export class Registrar {
     const tok = this.parseBody(resp.body)
     const access = (tok.accessToken as string) || ''
 
-    const usageUA = 'aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-0.6.18'
+    /*
+     * 注册产出的账号一律是 Builder ID，这条链路踩满了服务端 2026-08 改的两个口径：
+     *   1. UA 里的版本号被用作准入条件，报 KiroIDE-0.6.18 会一律 403
+     *      "User is not authorized to make this call."（社交账号不受影响，所以只在这里暴露）
+     *   2. profileArn 从可选变必填，不带同样 403。Builder ID 没有 profile 概念，
+     *      必须原样带 Kiro IDE 那个硬编码占位符
+     * 两处都改了才能拿到 200，只改一个仍然验活失败。
+     */
+    const usageUA = getKiroUserAgent()
+    const params = new URLSearchParams({
+      origin: 'AI_EDITOR',
+      resourceType: 'AGENTIC_REQUEST',
+      isEmailRequired: 'true',
+      profileArn: KIRO_BUILDER_ID_PLACEHOLDER_ARN
+    })
 
-    for (const baseURL of ['https://q.us-east-1.amazonaws.com/getUsageLimits', 'https://q.eu-central-1.amazonaws.com/getUsageLimits']) {
-      const usageURL = baseURL + '?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true'
+    for (const region of ['us-east-1', 'eu-central-1']) {
+      const usageURL = `${qServiceEndpoint(region)}/getUsageLimits?${params.toString()}`
       const usageResp = await this.doGet(usageURL, {
         'Accept': 'application/json',
         'Authorization': 'Bearer ' + access,
-        'User-Agent': usageUA
+        'User-Agent': usageUA,
+        'x-amz-user-agent': getKiroAmzUserAgent()
       })
 
       if (usageResp.status === 403 && usageResp.body.toLowerCase().includes('suspended')) {
@@ -1505,6 +1523,7 @@ export class Registrar {
       if (usageResp.status === 200) {
         return this.parseUsage(usageResp.body)
       }
+      this.log(`[验活] 用量查询 ${region} → ${usageResp.status}: ${usageResp.body.slice(0, 160)}`)
     }
     return { alive: false, error: 'usage query failed' }
   }

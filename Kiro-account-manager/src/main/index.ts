@@ -4,6 +4,7 @@ import * as machineIdModule from './machineId'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { writeFile, readFile } from 'fs/promises'
+import { createHash } from 'crypto'
 import { encode, decode } from 'cbor-x'
 import { fetch as undiciFetch, type RequestInit as UndiciRequestInit, type Dispatcher } from 'undici'
 import icon from '../../resources/icon.png?asset'
@@ -23,8 +24,21 @@ import {
   parseAccessTokenClaims,
   watchKiroAuthTokenFile,
   resolveProfileArnForWrite,
+  profileArnCandidates,
+  isEnterpriseLogin,
+  isPlaceholderProfileArn,
+  isProfileArnRejection,
+  isAccountBannedError,
   KIRO_AUTH_TOKEN_PATH
 } from './kiroAuthSync'
+// UA / 端点常量与反代共用一份，避免版本号漂移：服务端按 UA 里的 KiroIDE 版本号
+// 对 Builder ID / IdC 做准入，报旧版本会让用量、模型列表、对话一律 403。
+import {
+  getKiroUserAgent,
+  getKiroAmzUserAgent,
+  qServiceEndpoint,
+  qServiceFallbackEndpoint
+} from './kiroEndpoints'
 import { openaiToKiro } from './proxy/translator'
 import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
@@ -99,30 +113,15 @@ function setupAutoUpdater(): void {
 
 // ============ Kiro API 调用 ============
 const KIRO_API_BASE = 'https://app.kiro.dev/service/KiroWebPortalService/operation'
-// REST API 端点配置 - 官方 Kiro 插件仅支持 us-east-1 和 eu-central-1
-const KIRO_REST_API_ENDPOINTS: Record<string, string> = {
-  'us-east-1': 'https://q.us-east-1.amazonaws.com',
-  'eu-central-1': 'https://q.eu-central-1.amazonaws.com'
-}
 
-// 根据 SSO 区域映射到最近的 REST API 端点
+// REST API 端点（官方 Kiro 插件仅部署 us-east-1 与 eu-central-1），映射规则见 kiroEndpoints
 function getRestApiBase(ssoRegion?: string): string {
-  if (!ssoRegion) return KIRO_REST_API_ENDPOINTS['us-east-1']
-  // 如果是支持的端点区域，直接使用
-  if (KIRO_REST_API_ENDPOINTS[ssoRegion]) return KIRO_REST_API_ENDPOINTS[ssoRegion]
-  // EU 区域映射到 eu-central-1
-  if (ssoRegion.startsWith('eu-')) return KIRO_REST_API_ENDPOINTS['eu-central-1']
-  // 其他区域默认 us-east-1
-  return KIRO_REST_API_ENDPOINTS['us-east-1']
+  return qServiceEndpoint(ssoRegion)
 }
 
 // 获取备用 REST API 端点（用于 fallback）
 function getFallbackRestApiBase(ssoRegion?: string): string {
-  const primary = getRestApiBase(ssoRegion)
-  // 返回另一个端点作为 fallback
-  return primary === KIRO_REST_API_ENDPOINTS['eu-central-1']
-    ? KIRO_REST_API_ENDPOINTS['us-east-1']
-    : KIRO_REST_API_ENDPOINTS['eu-central-1']
+  return qServiceFallbackEndpoint(ssoRegion)
 }
 
 // API 类型配置
@@ -773,19 +772,6 @@ function generateInvocationId(): string {
   })
 }
 
-// Kiro 版本和 User-Agent 生成
-const KIRO_VERSION = '0.6.18'
-
-function getKiroUserAgent(machineId?: string): string {
-  const suffix = machineId ? `KiroIDE-${KIRO_VERSION}-${machineId}` : `KiroIDE-${KIRO_VERSION}`
-  return `aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E ${suffix}`
-}
-
-function getKiroAmzUserAgent(machineId?: string): string {
-  const suffix = machineId ? `KiroIDE ${KIRO_VERSION} ${machineId}` : `KiroIDE-${KIRO_VERSION}`
-  return `aws-sdk-js/1.0.18 ${suffix}`
-}
-
 function getCurrentMachineId(): string | undefined {
   const kproxyService = getKProxyService()
   if (!kproxyService) return undefined
@@ -1256,20 +1242,10 @@ interface UnifiedUsageResponse {
   }
 }
 
-async function getUsageAndLimits(
-  accessToken: string,
-  idp: string = 'BuilderId',
-  profileArn?: string,
-  accountMachineId?: string,  // 账户绑定的设备 ID
-  ssoRegion?: string,         // SSO 区域，用于选择正确的 REST API 端点
-  email?: string              // 用于日志标识
-): Promise<UnifiedUsageResponse> {
-  if (currentUsageApiType === 'rest') {
-    // 使用 REST API (GetUsageLimits)
-    const result = await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion, email)
-    // REST API 返回的字段名和 CBOR API 相同，直接返回
-    return {
-      usageBreakdownList: result.usageBreakdownList?.map(b => ({
+/** REST 用量响应 → 统一结构。CBOR 回退分支也走同一份映射，避免两处字段处理漂移。 */
+function mapRestUsageResponse(result: UsageLimitsResponse): UnifiedUsageResponse {
+  return {
+    usageBreakdownList: result.usageBreakdownList?.map(b => ({
         resourceType: b.resourceType || b.type,
         displayName: b.displayName,
         displayNamePlural: b.displayNamePlural,
@@ -1309,12 +1285,153 @@ async function getUsageAndLimits(
             : bonus.expiresAt
         }))
       })),
-      // REST API 返回的 nextDateReset 是 Unix 时间戳（秒），需要转换为 ISO 字符串
-      nextDateReset: normalizeResetDate(result.nextDateReset),
-      subscriptionInfo: result.subscriptionInfo,
-      overageConfiguration: result.overageConfiguration,
-      userInfo: result.userInfo
+    // REST API 返回的 nextDateReset 是 Unix 时间戳（秒），需要转换为 ISO 字符串
+    nextDateReset: normalizeResetDate(result.nextDateReset),
+    subscriptionInfo: result.subscriptionInfo,
+    overageConfiguration: result.overageConfiguration,
+    userInfo: result.userInfo
+  }
+}
+
+// ============ 用量查询：profileArn 候选逐个实测 ============
+
+/** 用量查询所需的账号身份字段 */
+interface UsageIdentity {
+  profileArn?: string
+  authMethod?: string
+  provider?: string
+  region?: string
+  machineId?: string
+  email?: string
+  idp?: string
+}
+
+/**
+ * Enterprise 真实 profile 的短期缓存。
+ *
+ * Enterprise 的正确 ARN 只能向 ListAvailableProfiles 查，而批量刷新会对同一账号
+ * 在短时间内多次走用量链路；没有缓存的话每次都多打一发请求。
+ * key 用 accessToken 的 hash，token 一轮换缓存自然失效。
+ */
+const ENTERPRISE_PROFILE_TTL = 10 * 60 * 1000
+const enterpriseProfileCache = new Map<string, { arn?: string; at: number }>()
+
+function accessTokenCacheKey(accessToken: string): string {
+  return createHash('sha256').update(accessToken).digest('hex').slice(0, 16)
+}
+
+/** 查 Enterprise 账号的真实 profileArn（带缓存），非 Enterprise 直接返回 undefined */
+async function resolveEnterpriseProfileArn(
+  accessToken: string,
+  identity: UsageIdentity
+): Promise<string | undefined> {
+  if (!isEnterpriseLogin(identity)) return undefined
+
+  const key = accessTokenCacheKey(accessToken)
+  const cached = enterpriseProfileCache.get(key)
+  if (cached && Date.now() - cached.at < ENTERPRISE_PROFILE_TTL) return cached.arn
+
+  let arn: string | undefined
+  try {
+    arn = await fetchEnterpriseProfileArn({
+      id: identity.email || 'usage-query',
+      accessToken,
+      region: identity.region || 'us-east-1',
+      provider: identity.provider,
+      authMethod: identity.authMethod as ProxyAccount['authMethod'],
+      machineId: identity.machineId
+    } as ProxyAccount)
+  } catch (e) {
+    console.warn('[Usage] Failed to resolve Enterprise profileArn:', e)
+  }
+  enterpriseProfileCache.set(key, { arn, at: Date.now() })
+  return arn
+}
+
+/**
+ * 查询用量，profileArn 逐个候选实测，并把真正生效的那个回传。
+ *
+ * 背景（服务端 2026-08 改了口径）：profileArn 从可选变必填，不带会被拒
+ * （用量 403、模型列表 400 "Invalid profileArn"）。此前这里一律传 undefined，
+ * Builder ID 账号的刷新用量、验活、后台批量刷新因此全部 403。
+ *
+ * 但「补一个」不能瞎补：Enterprise 必须用它自己 profile 的真实 ARN，内置兜底 ARN
+ * 属于另一个组织，送出去会被判 403 "Invalid token"。所以按成功率依次尝试：
+ * 账号已存的 ARN → Enterprise 的真实 profile → 按登录方式的默认值 → 不带。
+ *
+ * 只在 ARN 被拒时才换下一个；封禁与网络类错误立即抛出，不浪费请求。
+ * 调用方应把返回的 profileArn 写回账号，下次一次命中。
+ */
+async function queryUsageWithArnFallback(
+  accessToken: string,
+  idp: string,
+  identity: UsageIdentity
+): Promise<{ usage: UnifiedUsageResponse; profileArn?: string }> {
+  const resolvedEnterpriseArn = await resolveEnterpriseProfileArn(accessToken, identity)
+  const candidates = profileArnCandidates(identity, resolvedEnterpriseArn)
+  let lastError: unknown
+
+  for (const candidate of candidates) {
+    try {
+      // 批量刷新时并发较高，网络抖动很常见，带上有限重试减少「刷新失败」
+      const usage = await withUsageRetry('查询用量', () =>
+        getUsageAndLimits(accessToken, idp, candidate, identity.machineId, identity.region, identity.email)
+      )
+      return { usage, profileArn: candidate }
+    } catch (error) {
+      lastError = error
+      const msg = error instanceof Error ? error.message : String(error)
+      // 封禁与网络类错误换 ARN 也是同样结果，不浪费请求
+      if (isAccountBannedError(msg) || !isProfileArnRejection(msg)) throw error
+      console.warn(`[Usage] profileArn 候选被拒（${candidate ? 'set' : 'none'}），尝试下一个：${msg.slice(0, 160)}`)
     }
+  }
+  throw lastError
+}
+
+/**
+ * 对易受网络波动影响的用量调用做有限重试，间隔递增。
+ *
+ * 退避带抖动：批量刷新时多个通道往往同时失败，固定间隔会让它们下一轮再次撞在一起。
+ * 是否重试采信发起端按状态码给出的显式结论，没标注才回落到按错误文案判断——
+ * 同一句 403 在刷新端点（限流）与用量端点（确定性失败）上含义相反。
+ */
+async function withUsageRetry<T>(label: string, fn: () => Promise<T>, attempts = 3): Promise<T> {
+  let lastError: unknown
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn()
+    } catch (e) {
+      lastError = e
+      const msg = e instanceof Error ? e.message : String(e)
+      const retryable = (e as { retryable?: boolean }).retryable ?? isTransientUsageError(msg)
+      if (i === attempts - 1 || !retryable) break
+      console.warn(`[Usage] ${label} 第 ${i + 1} 次失败，准备重试：${msg.slice(0, 160)}`)
+      await new Promise(resolve => setTimeout(resolve, 600 * (i + 1) + Math.floor(Math.random() * 300)))
+    }
+  }
+  throw lastError
+}
+
+/** 只认标准的临时故障：授权类错误重试只会得到同样结果 */
+function isTransientUsageError(message: string): boolean {
+  if (/\b(408|425|429|500|502|503|504)\b/.test(message)) return true
+  return /ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|network/i.test(message)
+}
+
+async function getUsageAndLimits(
+  accessToken: string,
+  idp: string = 'BuilderId',
+  profileArn?: string,
+  accountMachineId?: string,  // 账户绑定的设备 ID
+  ssoRegion?: string,         // SSO 区域，用于选择正确的 REST API 端点
+  email?: string              // 用于日志标识
+): Promise<UnifiedUsageResponse> {
+  if (currentUsageApiType === 'rest') {
+    // 使用 REST API (GetUsageLimits)
+    return mapRestUsageResponse(
+      await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion, email)
+    )
   } else {
     // 使用 CBOR API (GetUserUsageAndLimits)
     // CBOR API (app.kiro.dev) 是网页端门户，仅支持 BuilderId 认证
@@ -1333,55 +1450,15 @@ async function getUsageAndLimits(
       // CBOR 401/403 时自动 fallback 到 REST API
       if (errorMsg.includes('401') || errorMsg.includes('403')) {
         console.log(`[API] CBOR API failed (${errorMsg}), falling back to REST API...`)
-        const result = await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion, email)
-        return {
-          usageBreakdownList: result.usageBreakdownList?.map(b => ({
-            resourceType: b.resourceType || b.type,
-            displayName: b.displayName,
-            displayNamePlural: b.displayNamePlural,
-            currentUsage: b.currentUsage,
-            currentUsageWithPrecision: b.currentUsageWithPrecision,
-            usageLimit: b.usageLimit,
-            usageLimitWithPrecision: b.usageLimitWithPrecision,
-            currency: b.currency,
-            unit: b.unit,
-            overageRate: b.overageRate,
-            overageCap: b.overageCap,
-            type: b.type,
-            freeTrialInfo: b.freeTrialInfo ? {
-              freeTrialStatus: b.freeTrialInfo.freeTrialStatus,
-              usageLimit: b.freeTrialInfo.usageLimit,
-              usageLimitWithPrecision: b.freeTrialInfo.usageLimitWithPrecision,
-              currentUsage: b.freeTrialInfo.currentUsage,
-              currentUsageWithPrecision: b.freeTrialInfo.currentUsageWithPrecision,
-              freeTrialExpiry: typeof b.freeTrialInfo.freeTrialExpiry === 'number' 
-                ? new Date(b.freeTrialInfo.freeTrialExpiry * 1000).toISOString() 
-                : b.freeTrialInfo.freeTrialExpiry
-            } : (b.freeTrialUsage ? {
-              freeTrialStatus: b.freeTrialUsage.freeTrialStatus,
-              usageLimit: b.freeTrialUsage.usageLimit,
-              usageLimitWithPrecision: b.freeTrialUsage.usageLimitWithPrecision,
-              currentUsage: b.freeTrialUsage.currentUsage,
-              currentUsageWithPrecision: b.freeTrialUsage.currentUsageWithPrecision,
-              freeTrialExpiry: b.freeTrialUsage.freeTrialExpiry
-            } : undefined),
-            bonuses: b.bonuses?.map(bonus => ({
-              ...bonus,
-              expiresAt: typeof bonus.expiresAt === 'number' 
-                ? new Date(bonus.expiresAt * 1000).toISOString() 
-                : bonus.expiresAt
-            }))
-          })),
-          nextDateReset: normalizeResetDate(result.nextDateReset as unknown as number | string),
-          subscriptionInfo: result.subscriptionInfo,
-          overageConfiguration: result.overageConfiguration,
-          userInfo: result.userInfo
-        }
+        return mapRestUsageResponse(
+          await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion, email)
+        )
       }
       throw cborError
     }
   }
 }
+
 
 // GetUserInfo API - 只需要 accessToken 即可调用
 interface UserInfoResponse {
@@ -1875,6 +1952,8 @@ const PROACTIVE_RENEWAL_LEAD_MS = 15 * 60 * 1000
 // poolRefreshInFlightIds 去重，避免对同一 refreshToken 并发刷新把其中一个用作废。
 type BackgroundRefreshAccount = {
   id: string
+  /** 仅用于日志标识；渲染进程与主进程调度器都会带上 */
+  email?: string
   idp?: string
   profileArn?: string
   needsTokenRefresh?: boolean
@@ -1963,6 +2042,7 @@ async function runMainPoolTokenRefreshTick(): Promise<void> {
       if (!expiresAt || expiresAt - now > leadMs) continue
       toRefresh.push({
         id,
+        email: acc.email,
         idp: acc.idp,
         profileArn: acc.profileArn,
         needsTokenRefresh: true,
@@ -3058,29 +3138,21 @@ app.whenReady().then(async () => {
         console.warn('[Refresh] Failed to sync token to IDE:', e)
       }
 
-      // 刷新后自动获取 profileArn（仅 Enterprise 需要调 API，其他类型不调）
+      // 刷新后自动获取 profileArn：仅 Enterprise 需要调 ListAvailableProfiles，
+      // BuilderId / Social 没有 profile 概念，用量链路会按登录方式补固定值
       let resolvedEnterpriseArn: string | undefined
       const existingProfileArn = account.profileArn || account.credentials?.profileArn
       if (!existingProfileArn) {
-        const isEnt = provider === 'Enterprise' || authMethod === 'external_idp'
-        if (isEnt) {
-          try {
-            resolvedEnterpriseArn = await fetchEnterpriseProfileArn({
-              id: account.id || '',
-              accessToken: newAccess,
-              region: region || 'us-east-1',
-              provider,
-              authMethod: authMethod as 'IdC' | 'social' | 'idc' | 'external_idp' | undefined,
-              machineId: account.machineId
-            })
-            if (resolvedEnterpriseArn) {
-              console.log(`[Refresh] Enterprise profileArn auto-resolved: ${resolvedEnterpriseArn}`)
-            }
-          } catch (e) {
-            console.warn('[Refresh] Failed to fetch Enterprise profileArn:', e)
-          }
+        resolvedEnterpriseArn = await resolveEnterpriseProfileArn(newAccess, {
+          authMethod,
+          provider,
+          region,
+          machineId: account.machineId,
+          email: account.email
+        })
+        if (resolvedEnterpriseArn) {
+          console.log(`[Refresh] Enterprise profileArn auto-resolved: ${resolvedEnterpriseArn}`)
         }
-        // BuilderId/Social 不调 API，不需要返回 profileArn（反代自愈时用 resolveProfileArn 兜底）
       }
 
       return {
@@ -3202,12 +3274,17 @@ app.whenReady().then(async () => {
 
       try {
         console.log('[SSO] Fetching user info and usage data...')
+        // SSO 导入的一律是 Builder ID：用量接口要求带 profileArn，
+        // 不带就 403 User is not authorized，由候选回退补上占位符
         const [userInfoResult, usageResult] = await Promise.all([
           getUserInfo(ssoResult.accessToken).catch(e => { console.error('[SSO] getUserInfo failed:', e); return undefined }),
-          getUsageAndLimits(ssoResult.accessToken, 'BuilderId', undefined, undefined, region).catch(e => { console.error('[SSO] getUsageAndLimits failed:', e); return undefined })
+          queryUsageWithArnFallback(ssoResult.accessToken, 'BuilderId', {
+            provider: 'BuilderId',
+            region
+          }).catch(e => { console.error('[SSO] getUsageAndLimits failed:', e); return undefined })
         ])
         userInfo = userInfoResult
-        usageData = usageResult
+        usageData = usageResult?.usage
         console.log('[SSO] userInfo:', userInfo?.email)
         console.log('[SSO] usageData:', usageData?.subscriptionInfo?.subscriptionTitle)
       } catch (e) {
@@ -3378,11 +3455,13 @@ app.whenReady().then(async () => {
     }
 
     // 解析 API 响应的辅助函数
+    // resolvedProfileArn：实测生效的 profileArn，回传给 renderer 持久化到账号，
+    // 下次刷新一次命中（Enterprise 因此不必每轮都重查 ListAvailableProfiles）
     const parseUsageResponse = (result: UsageResponse, newCredentials?: {
       accessToken: string
       refreshToken?: string
       expiresIn?: number
-    }, userInfo?: UserInfoResponse) => {
+    }, userInfo?: UserInfoResponse, resolvedProfileArn?: string) => {
       console.log(`[Kiro API] Usage [${account?.email || userInfo?.email || 'unknown'}]`, result)
 
       // 解析 Credits 使用量（resourceType 为 CREDIT）
@@ -3467,6 +3546,7 @@ app.whenReady().then(async () => {
           idp: userInfo?.idp,
           userStatus: userInfo?.status,
           featureFlags: userInfo?.featureFlags,
+          profileArn: resolvedProfileArn,
           subscriptionTitle,
           usage: {
             current: totalUsed,
@@ -3529,6 +3609,17 @@ app.whenReady().then(async () => {
       // 获取账户绑定的设备 ID
       const accountMachineId = account?.machineId as string | undefined
 
+      // 用量接口的 profileArn 身份：Builder ID 不带占位符会直接 403，
+      // Enterprise 补错 ARN 会被判 403 Invalid token，两者都由候选回退处理
+      const usageIdentity: UsageIdentity = {
+        profileArn: account?.profileArn || account?.credentials?.profileArn,
+        authMethod,
+        provider: provider || account?.idp,
+        region,
+        machineId: accountMachineId,
+        email: account?.email
+      }
+
       // 第一次尝试：使用当前 accessToken
       try {
         // 并行调用 GetUserInfo 和 getUsageAndLimits
@@ -3540,9 +3631,9 @@ app.whenReady().then(async () => {
             }
             return undefined
           }),
-          getUsageAndLimits(accessToken, idp, undefined, accountMachineId, region, account?.email)
+          queryUsageWithArnFallback(accessToken, idp, usageIdentity)
         ])
-        return parseUsageResponse(usageResult, undefined, userInfoResult)
+        return parseUsageResponse(usageResult.usage, undefined, userInfoResult, usageResult.profileArn)
       } catch (apiError) {
         const errorMsg = apiError instanceof Error ? apiError.message : ''
         
@@ -3582,15 +3673,15 @@ app.whenReady().then(async () => {
                 }
                 return undefined
               }),
-              getUsageAndLimits(refreshResult.accessToken, idp, undefined, accountMachineId, region)
+              queryUsageWithArnFallback(refreshResult.accessToken, idp, usageIdentity)
             ])
-            
+
             // 返回结果并包含新凭证
-            return parseUsageResponse(usageResult, {
+            return parseUsageResponse(usageResult.usage, {
               accessToken: refreshResult.accessToken,
               refreshToken: refreshResult.refreshToken,
               expiresIn: refreshResult.expiresIn
-            }, userInfoResult)
+            }, userInfoResult, usageResult.profileArn)
           } else {
             console.error('[IPC] Token refresh failed:', refreshResult.error)
             return {
@@ -3729,25 +3820,22 @@ app.whenReady().then(async () => {
               }
             }
 
-            // Enterprise 账号：后台刷新后自动获取 profileArn（BuilderId/Social 不需要调 API）
+            // 用量接口的 profileArn 身份（Builder ID 必须带占位符，否则 403）
             const existingProfileArn = account.profileArn || account.credentials?.profileArn
+            const bgUsageIdentity: UsageIdentity = {
+              profileArn: existingProfileArn,
+              authMethod,
+              provider: provider || account.idp,
+              region,
+              machineId: account.machineId,
+              email: account.email
+            }
+            // Enterprise 账号：后台刷新后自动获取真实 profileArn（BuilderId/Social 没有 profile 概念，不调 API）
             let resolvedBgProfileArn: string | undefined
-            const isEnt = (provider || account.idp) === 'Enterprise' || authMethod === 'external_idp'
-            if (!existingProfileArn && newAccessToken && isEnt) {
-              try {
-                resolvedBgProfileArn = await fetchEnterpriseProfileArn({
-                  id: account.id || '',
-                  accessToken: newAccessToken,
-                  region: region || 'us-east-1',
-                  provider: provider || account.idp,
-                  authMethod: authMethod as 'IdC' | 'social' | 'idc' | 'external_idp' | undefined,
-                  machineId: account.machineId
-                })
-                if (resolvedBgProfileArn) {
-                  console.log(`[BackgroundRefresh] Enterprise profileArn auto-resolved: ${resolvedBgProfileArn} (${account.id})`)
-                }
-              } catch (e) {
-                console.warn(`[BackgroundRefresh] Failed to fetch Enterprise profileArn for ${account.id}:`, e)
+            if (!existingProfileArn && newAccessToken && isEnterpriseLogin(bgUsageIdentity)) {
+              resolvedBgProfileArn = await resolveEnterpriseProfileArn(newAccessToken, bgUsageIdentity)
+              if (resolvedBgProfileArn) {
+                console.log(`[BackgroundRefresh] Enterprise profileArn auto-resolved: ${resolvedBgProfileArn} (${account.id})`)
               }
             }
 
@@ -3831,7 +3919,10 @@ app.whenReady().then(async () => {
                   }
                 }
                 console.log(`[BackgroundRefresh] Account ${account.id} machineId: ${account.machineId || 'undefined'}`)
-                const rawUsage = await getUsageAndLimits(newAccessToken, idp, undefined, account.machineId, region) as UsageResponse
+                const usageQuery = await queryUsageWithArnFallback(newAccessToken, idp, bgUsageIdentity)
+                const rawUsage = usageQuery.usage as UsageResponse
+                // 实测生效的 ARN 优先于 ListAvailableProfiles 的结果回传给 renderer 持久化
+                if (usageQuery.profileArn) resolvedBgProfileArn = usageQuery.profileArn
                 
                 // 解析使用量数据
                 const creditUsage = rawUsage.usageBreakdownList?.find(b => b.resourceType === 'CREDIT')
@@ -4006,8 +4097,11 @@ app.whenReady().then(async () => {
       region?: string
       authMethod?: string
       provider?: string
+      profileArn?: string
     }
     idp?: string
+    profileArn?: string
+    machineId?: string
   }>, concurrency: number = 10) => {
     console.log(`[BackgroundCheck] Starting batch check for ${accounts.length} accounts, concurrency: ${concurrency}`)
     
@@ -4041,9 +4135,19 @@ app.whenReady().then(async () => {
               idp = provider
             }
 
+            // 用量接口的 profileArn 身份（Builder ID 不带占位符会直接 403）
+            const checkUsageIdentity: UsageIdentity = {
+              profileArn: account.profileArn || account.credentials?.profileArn,
+              authMethod,
+              provider: provider || account.idp,
+              region: account.credentials?.region,
+              machineId: account.machineId,
+              email: account.email
+            }
+
             // 调用 API 获取用量和用户信息（根据配置选择 REST 或 CBOR 格式）
             const [usageRes, userInfoRes] = await Promise.allSettled([
-              getUsageAndLimits(accessToken, idp, undefined, undefined, account.credentials?.region, account.email) as Promise<{
+              queryUsageWithArnFallback(accessToken, idp, checkUsageIdentity).then(r => r.usage) as Promise<{
                 usageBreakdownList?: Array<{
                   resourceType?: string
                   displayName?: string
@@ -4376,6 +4480,8 @@ app.whenReady().then(async () => {
     region?: string
     authMethod?: string
     provider?: string  // 'BuilderId', 'Github', 'Google' 等
+    /** 在线登录会带回上游给出的真实 ARN，有就优先用，省掉候选试探 */
+    profileArn?: string
   }) => {
     console.log('[IPC] verify-account-credentials called')
     
@@ -4455,8 +4561,22 @@ app.whenReady().then(async () => {
         userInfo?: { email?: string; userId?: string }
       }
       
-      const usageResult = await getUsageAndLimits(refreshResult.accessToken, idp, undefined, undefined, region) as UsageResponse
-      
+      /*
+       * 用量接口现在必须带 profileArn，此处原先固定传 undefined，
+       * 会让新增的 Builder ID 账号直接验活失败（403 User is not authorized）。
+       * 走候选回退而不是单个猜测：Enterprise 补错 ARN 会被判 403 Invalid token。
+       * 生效的那个随结果返回，账号建好后就带着正确的 ARN，后续不必重新试。
+       */
+      const verifyUsage = await queryUsageWithArnFallback(refreshResult.accessToken, idp, {
+        profileArn: credentials.profileArn,
+        authMethod,
+        provider,
+        region,
+        email: undefined
+      })
+      const usageResult = verifyUsage.usage as UsageResponse
+      const verifiedProfileArn = verifyUsage.profileArn
+
       // 解析用户信息
       const email = usageResult.userInfo?.email || ''
       const userId = usageResult.userInfo?.userId || ''
@@ -4525,26 +4645,13 @@ app.whenReady().then(async () => {
       
       console.log('[Verify] Success! Email:', email)
 
-      // Enterprise 账号：验证时自动获取 profileArn（BuilderId/Social 不需要调 API）
-      let enterpriseProfileArn: string | undefined
-      const isEnt = provider === 'Enterprise' || authMethod === 'external_idp'
-      if (isEnt) {
-        try {
-          enterpriseProfileArn = await fetchEnterpriseProfileArn({
-            id: '',
-            accessToken: refreshResult.accessToken!,
-            region: region || 'us-east-1',
-            provider,
-            authMethod: authMethod as 'IdC' | 'social' | 'idc' | 'external_idp' | undefined
-          })
-          if (enterpriseProfileArn) {
-            console.log(`[Verify] Enterprise profileArn auto-resolved: ${enterpriseProfileArn}`)
-          }
-        } catch (e) {
-          console.warn('[Verify] Failed to fetch Enterprise profileArn:', e)
-        }
+      // 用量查询里实测生效的那个 ARN 就是答案（Enterprise 的真实 profile 已在
+      // 候选构造阶段查过并缓存），不必再单独调一次 ListAvailableProfiles。
+      // 占位符不回传：它是「按登录方式补的默认值」而非账号属性，存进账号只会掩盖真实状态。
+      if (verifiedProfileArn) {
+        console.log(`[Verify] profileArn verified: ${verifiedProfileArn}`)
       }
-      
+
       return {
         success: true,
         data: {
@@ -4553,7 +4660,7 @@ app.whenReady().then(async () => {
           accessToken: refreshResult.accessToken,
           refreshToken: refreshResult.refreshToken || refreshToken,
           expiresIn: refreshResult.expiresIn,
-          profileArn: enterpriseProfileArn || undefined,
+          profileArn: isPlaceholderProfileArn(verifiedProfileArn) ? undefined : verifiedProfileArn,
           subscriptionType,
           subscriptionTitle,
           subscription: {
