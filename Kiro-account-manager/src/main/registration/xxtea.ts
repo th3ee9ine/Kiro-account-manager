@@ -17,13 +17,36 @@ function extractFromAppJS(js: string): {
   let identifier = ''
   let version = ''
 
-  const keyMatch = js.match(
-    /var\s+\w+\s*=\s*\[(\d+),\s*"([A-Za-z0-9]+)",\s*(\d+),\s*(\d+),\s*(\d+)\]/
+  // 线上 app.js（2026-09 实测）里 keyProvider 的形态是：
+  //   var e=[2576816180,1888420705,2347232058,"ECdITeCs",874813317,29115,32807];
+  //   return{identifier:e[3],material:[e[1],e[0],e[2],e[4]]}
+  // 即：先声明一个混合了数字与 identifier 的常量数组，再按下标重排出 4 个 key。
+  // 下标顺序会随构建变化，所以这里**跟着 material 的下标去取**，而不是假定固定顺序。
+  //
+  // 旧正则假定形如 `var x=[num,"id",num,num,num]`（identifier 固定在第 2 位、只有 4 个数字），
+  // 与线上形态不符 → 长期静默失配、一直回退 fallback。
+  // （注：当前 fallback 的取值与线上完全一致，所以此前功能未受影响，只是日志误导。）
+  const providerMatch = js.match(
+    /var\s+(\w+)\s*=\s*\[([^\]]*"[A-Za-z0-9]{4,}"[^\]]*)\]\s*;\s*return\s*\{\s*identifier\s*:\s*\1\[(\d+)\]\s*,\s*material\s*:\s*\[\s*\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*,\s*\1\[(\d+)\]\s*\]/
   )
-  if (keyMatch) {
-    const nums = [keyMatch[1], keyMatch[3], keyMatch[4], keyMatch[5]].map(Number)
-    key = [nums[2], nums[0], nums[3], nums[1]]
-    identifier = keyMatch[2]
+  if (providerMatch) {
+    // 拆常量数组：元素或是十进制数字，或是带引号的 identifier
+    const items = providerMatch[2].split(',').map((s) => s.trim())
+    const idIdx = Number(providerMatch[3])
+    const matIdx = [4, 5, 6, 7].map((g) => Number(providerMatch[g]))
+
+    const idRaw = items[idIdx]
+    const idVal = idRaw && /^"([^"]+)"$/.test(idRaw) ? idRaw.slice(1, -1) : ''
+
+    const nums = matIdx.map((i) => {
+      const raw = items[i]
+      return raw !== undefined && /^\d+$/.test(raw) ? Number(raw) : NaN
+    })
+
+    if (idVal && nums.every((n) => Number.isFinite(n))) {
+      key = [nums[0], nums[1], nums[2], nums[3]]
+      identifier = idVal
+    }
   }
 
   const verMatch = js.match(/FWCIM_VERSION\s*=\s*"(\d+\.\d+\.\d+)"/)

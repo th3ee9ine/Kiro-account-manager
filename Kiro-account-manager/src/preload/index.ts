@@ -1174,6 +1174,13 @@ const api = {
     gptMailDomain?: string
     gptMailPrefix?: string
     gptMailPrivatePassword?: string
+    useICloud?: boolean
+    icloudData?: string
+    icloudBaseURL?: string
+    icloudLimit?: number
+    recoverExisting?: boolean
+    captchaUnattended?: boolean
+    knownPassword?: string
     password?: string
     fullName?: string
     taskId?: string

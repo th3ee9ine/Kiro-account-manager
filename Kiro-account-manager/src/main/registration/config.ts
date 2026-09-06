@@ -52,6 +52,33 @@ export interface RegistrationConfig {
   gptMailPrefix: string       // 可选：固定前缀，留空则 randomEmailPrefix() 生成
   gptMailPrivatePassword: string  // 可选：仅私有域名模式有效。在 GPTmail 设私有域名时设的密码
 
+  // iCloud 取件（assurivo「取件链接」）—— 买来的 iCloud 邮箱池，格式 `邮箱----查询码`
+  // 与 Outlook 同为"池化"模式：前端按行分配，每个任务独占一行避免并发抢号
+  useICloud: boolean
+  icloudData: string      // 多行 `邮箱----查询码`（批量时前端已切成单行）
+  icloudBaseURL: string   // 可选，默认 https://assurivo.com
+  icloudLimit: number     // 可选，单次取件封数（1..20，默认 10）
+
+  /**
+   * 邮箱已在 AWS 注册过时，是否自动走「邮箱验证码登录」把该账号找回（默认开启）。
+   * 适用于注册中断留下的号，或已注册但凭据丢失的号 —— 拿到的 token 与新注册等价。
+   * 需要邮箱源支持取码（Outlook 模式暂不支持）。
+   */
+  recoverExisting: boolean
+
+  /**
+   * 无人值守模式：AMS 人机校验需要人工点选时立即失败，而不是弹窗干等。
+   * 批量注册应开启 —— 干等一个不在场的人只是白占并发槽。
+   * 单次手动注册保持关闭，这样偶发的校验用户可以自己过掉。
+   */
+  captchaUnattended: boolean
+
+  /**
+   * 已知的原密码：仅用于「邮箱已注册且已设密码」时的密码登录找回。
+   * password 字段每次随机生成，对历史账号必然不匹配，故需单独提供。
+   */
+  knownPassword: string
+
   // 手动模式
   manualMode: boolean
 }
@@ -106,6 +133,13 @@ export function newConfig(overrides?: Partial<RegistrationConfig>): Registration
     gptMailDomain: '',
     gptMailPrefix: '',
     gptMailPrivatePassword: '',
+    useICloud: false,
+    icloudData: '',
+    icloudBaseURL: '',
+    icloudLimit: 10,
+    recoverExisting: true,
+    captchaUnattended: false,
+    knownPassword: '',
     manualMode: false,
     ...overrides
   }

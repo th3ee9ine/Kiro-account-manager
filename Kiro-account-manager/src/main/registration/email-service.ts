@@ -764,6 +764,366 @@ export class GptMailService implements TempEmailService {
   }
 }
 
+// ============ iCloud 取件（assurivo 取件链接） ============
+
+/** iCloud 邮箱账号（assurivo 卖号格式：邮箱----查询码） */
+export interface ICloudAccount {
+  email: string
+  /** 邮件查询码（站点侧的取件口令，不是 Apple ID 密码） */
+  pwd: string
+}
+
+/**
+ * 解析 assurivo 的 `邮箱----查询码` 多行文本。
+ *
+ * 与 Outlook 的 parseOutlookLines 不同：这里固定 2 段，且分隔符就是 4 个连字符。
+ * 查询码本身是 [A-Za-z0-9] 随机串（实测样本无连字符），所以按第一个 `----` 切分即可，
+ * 多余的 `----` 归还给查询码（跟站点前端 `parts.join('----')` 的口径一致）。
+ */
+export function parseICloudLines(data: string): ICloudAccount[] {
+  const out: ICloudAccount[] = []
+  const seen = new Set<string>()
+  for (const rawLine of (data || '').split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line || !line.includes('----')) continue
+    const parts = line.split('----')
+    const email = (parts.shift() || '').trim().toLowerCase()
+    const pwd = parts.join('----').trim()
+    if (!email || !pwd || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) continue
+    if (seen.has(email)) continue
+    seen.add(email)
+    out.push({ email, pwd })
+  }
+  return out
+}
+
+/**
+ * iCloud 取码源（assurivo「取件链接」）。
+ *
+ * 玩法：用户在 assurivo 批量买到 iCloud 邮箱，每个号一条 `邮箱----查询码`。
+ * 这些邮箱是**已存在的固定邮箱**（不是随机生成的），所以本类跟 Outlook 一样属于
+ * "池化"模式 —— 每个注册任务独占一行，前端按行分配避免并发抢号。
+ *
+ * 协议（来自 https://assurivo.com/console/api-links.php 的接口参数说明 + 实测）：
+ *   GET /console/feed.php?mail=<邮箱>&pwd=<查询码>&limit=<1..20>
+ *     200 {"status":"success","data":[ ...最近邮件... ]}
+ *     401 {"status":"error","message":"Authentication failed."}   ← 邮箱/查询码不对
+ *     405 {"status":"error","message":"Method not allowed."}      ← 只接受 GET
+ *   （另有 /console/open.php 同参数返回网页版，本类不用）
+ *
+ * 注意：
+ *  - 这是普通 nginx + PHP，没有 Cloudflare TLS 指纹校验，用 undici/系统代理直连即可，
+ *    不需要像 GPTmail 那样借 Registrar 的 SessionClient。
+ *  - data[] 内单封邮件的字段名以站点控制台的口径为准（from_email/to_email/subject/
+ *    body_excerpt/created_at/html_body 等），但 feed.php 未必与控制台完全一致，
+ *    因此取码时对整个邮件对象做递归字符串扫描，不依赖具体字段名。
+ */
+export class ICloudFeedService implements TempEmailService {
+  private static readonly DEFAULT_BASE_URL = 'https://assurivo.com'
+  private static readonly UA =
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
+
+  private readonly baseURL: string
+  private readonly address: string
+  private readonly pwd: string
+  /** 单次取多少封（站点上限 20） */
+  private readonly limit: number
+  private readonly log: (msg: string) => void
+  /** create() 时 inbox 里已有的邮件 ID 基线，轮询时跳过，避免历史验证码污染 */
+  private baselineIds = new Set<string>()
+  /** 首封邮件是否已打印字段名（便于站点改字段时排查） */
+  private loggedShape = false
+
+  constructor(opts: {
+    baseURL?: string
+    email: string
+    pwd: string
+    limit?: number
+    log?: (msg: string) => void
+  }) {
+    this.baseURL = ICloudFeedService.normalizeBaseURL(opts.baseURL || ICloudFeedService.DEFAULT_BASE_URL)
+    this.address = (opts.email || '').trim().toLowerCase()
+    this.pwd = (opts.pwd || '').trim()
+    if (!this.address || !this.address.includes('@')) {
+      throw new Error('iCloud 邮箱地址无效（应为 xxx@icloud.com）')
+    }
+    if (!this.pwd) {
+      throw new Error(`iCloud 邮件查询码为空: ${this.address}`)
+    }
+    const n = Math.floor(opts.limit ?? 10)
+    this.limit = Math.min(20, Math.max(1, Number.isFinite(n) ? n : 10))
+    this.log = opts.log || ((m) => console.log(m))
+  }
+
+  private static normalizeBaseURL(raw: string): string {
+    const trimmed = (raw || '').trim().replace(/\/+$/, '')
+    if (!trimmed) return ICloudFeedService.DEFAULT_BASE_URL
+    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`
+    let u: URL
+    try {
+      u = new URL(withScheme)
+    } catch {
+      throw new Error(`iCloud 取件 BaseURL 格式无效: ${raw}`)
+    }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+      throw new Error(`iCloud 取件 BaseURL 协议不支持 (仅支持 http/https): ${u.protocol}`)
+    }
+    return withScheme
+  }
+
+  async create(): Promise<string> {
+    // 邮箱是买来的固定地址，无需创建。这里只做一次连通性 + 凭据校验，
+    // 并记录已有邮件作为基线 —— 提前暴露"查询码错误"，避免白跑一整轮注册再超时。
+    const mails = await this.fetchMails()
+    for (const mail of mails) {
+      const id = this.mailId(mail)
+      if (id) this.baselineIds.add(id)
+    }
+    this.log(
+      `[iCloud] 使用邮箱: ${this.address}` +
+      (this.baselineIds.size > 0 ? `（基线邮件 ${this.baselineIds.size} 封，轮询时跳过）` : '')
+    )
+    return this.address
+  }
+
+  getAddress(): string {
+    return this.address
+  }
+
+  async waitForCode(timeoutSec: number, intervalSec: number, signal?: AbortSignal): Promise<string> {
+    const maxRetries = Math.max(1, Math.floor(timeoutSec / intervalSec))
+    const checkedIds = new Set<string>(this.baselineIds)
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      if (signal?.aborted) throw new Error('注册已取消')
+      await abortableSleep(intervalSec * 1000, signal)
+      try {
+        const mails = await this.fetchMails()
+        if (attempt === 1 || attempt % 5 === 0) {
+          this.log(`[iCloud] [${attempt}/${maxRetries}] ${this.address} 邮件数: ${mails.length}`)
+        }
+        // 同一收件箱里 AWS 还会发通知/营销邮件，且可能比验证码邮件更新。
+        // 先挑"看起来就是验证码邮件"的（发件人 signin.aws / 主题含 verify|验证码），
+        // 再看其余邮件；两组内部都按 saved_at 从新到旧，避免拿到过期的旧码。
+        const candidates = [...mails].sort((a, b) => {
+          const rank = (m: Record<string, unknown>): number => (looksLikeOtpMail(m) ? 0 : 1)
+          const r = rank(a) - rank(b)
+          if (r !== 0) return r
+          return String(b.saved_at ?? b.created_at ?? b.date ?? '').localeCompare(
+            String(a.saved_at ?? a.created_at ?? a.date ?? '')
+          )
+        })
+
+        for (const mail of candidates) {
+          const id = this.mailId(mail)
+          // 无 id 的邮件无法去重，仍尝试取码（宁可重复扫描也不漏码）
+          if (id) {
+            if (checkedIds.has(id)) continue
+            checkedIds.add(id)
+          }
+          const code = this.extractOTP(mail)
+          if (code) {
+            this.log(`[iCloud] 提取到验证码: ${code} (subject=${String(mail.subject ?? '').slice(0, 50)})`)
+            return code
+          }
+        }
+      } catch (err) {
+        // 凭据错误不会自愈，立即抛出而不是傻等到超时
+        if (err instanceof Error && /Authentication failed/i.test(err.message)) {
+          throw new Error(`iCloud 取件鉴权失败（邮箱或查询码不正确）: ${this.address}`)
+        }
+        if (attempt % 5 === 0) {
+          this.log(`[iCloud] [${attempt}/${maxRetries}] 查询失败: ${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+    }
+    throw new Error(`iCloud 等待验证码超时 (${timeoutSec}s)`)
+  }
+
+  /** GET /console/feed.php，返回 data[] 里的邮件数组 */
+  private async fetchMails(): Promise<Array<Record<string, unknown>>> {
+    const qs = new URLSearchParams({ mail: this.address, pwd: this.pwd, limit: String(this.limit) })
+    const url = `${this.baseURL}/console/feed.php?${qs.toString()}`
+
+    const resp = await proxyFetch(url, {
+      headers: {
+        'accept': 'application/json, text/plain, */*',
+        'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'user-agent': ICloudFeedService.UA,
+        'referer': `${this.baseURL}/console/api-links.php`
+      },
+      signal: AbortSignal.timeout(20000)
+    })
+
+    const text = await resp.text()
+    let data: unknown
+    try { data = JSON.parse(text) } catch { data = null }
+
+    if (resp.status < 200 || resp.status >= 300) {
+      const msg = (data && typeof data === 'object' && typeof (data as Record<string, unknown>).message === 'string')
+        ? (data as Record<string, unknown>).message as string
+        : text.slice(0, 200)
+      throw new Error(`iCloud feed HTTP ${resp.status}: ${msg}`)
+    }
+    if (!data || typeof data !== 'object') {
+      throw new Error(`iCloud feed 返回非 JSON: ${text.slice(0, 200)}`)
+    }
+
+    const obj = data as Record<string, unknown>
+    if (obj.status !== 'success') {
+      throw new Error(`iCloud feed 返回失败: ${String(obj.message ?? JSON.stringify(obj).slice(0, 200))}`)
+    }
+    const arr = obj.data
+    if (!Array.isArray(arr)) return []
+    const mails = arr.filter((x): x is Record<string, unknown> => !!x && typeof x === 'object')
+
+    // 站点若调整字段名，日志里留下首封邮件的字段清单便于定位
+    if (!this.loggedShape && mails.length > 0) {
+      this.loggedShape = true
+      this.log(`[iCloud] feed 邮件字段: ${Object.keys(mails[0]).join(', ')}`)
+    }
+    return mails
+  }
+
+  /**
+   * 取邮件唯一标识，用于基线跳过与轮询去重。
+   *
+   * 实测 feed.php 的邮件对象**没有任何 id 字段**（只有 body/from/saved_at/subject/to），
+   * 所以主路径是「saved_at + from + subject 复合键」——saved_at 精确到秒，
+   * 同一秒同发件人同主题的两封邮件在本场景下可视为同一封。
+   * 仍保留 id 类字段的探测：万一站点后续加上 id，会自动优先用它。
+   */
+  private mailId(mail: Record<string, unknown>): string {
+    for (const key of ['id', 'message_id', 'msg_id', 'uid', 'mail_id']) {
+      const v = mail[key]
+      if (typeof v === 'string' && v) return v
+      if (typeof v === 'number' && Number.isFinite(v)) return String(v)
+    }
+    const savedAt = String(mail.saved_at ?? mail.created_at ?? mail.date ?? '')
+    const from = String(mail.from ?? mail.from_email ?? mail.from_address ?? '')
+    const subject = String(mail.subject ?? '')
+    const composite = `${savedAt}|${from}|${subject}`
+    return composite === '||' ? '' : composite
+  }
+
+  /**
+   * 从邮件对象里提取 6 位验证码。
+   *
+   * 不能直接对整封邮件套 `\b\d{6}\b`：实测同一个 iCloud 收件箱里，AWS 除了验证码邮件
+   * 还会发 "Response Required: Action Needed on Your AWS Account" 这类 HTML 营销/通知邮件，
+   * 其正文里满是假 6 位数字 —— awstrack.me 追踪链接里的 `...-000000/...`、CSS 颜色 `#555555`。
+   * 这类邮件的 saved_at 可能比验证码邮件更新（排在更前面），一旦误取就会拿错码。
+   *
+   * 因此分三层：
+   *   1) 主题里的 6 位数字（部分服务把码放主题）
+   *   2) 正文：优先用「验证码标签词 + 邻近 6 位数字」的锚定匹配（AWS 原文是
+   *      `Verification code:: 833798`），并在匹配前剥掉 HTML 标签/属性，
+   *      避免 URL、hex 颜色等噪声进入候选
+   *   3) 兜底：全对象递归扫描，但同样先做噪声剥离
+   */
+  private extractOTP(mail: Record<string, unknown>): string {
+    const subject = String(mail.subject ?? mail.title ?? '')
+    const subjMatch = subject.match(/(\d{6})/)
+    if (subjMatch) return subjMatch[1]
+
+    // 实测 feed.php 的正文字段就叫 `body`（AWS 验证码邮件是纯文本，其他邮件是 HTML），
+    // 其余键名是为站点改字段/其他部署留的兜底。
+    const bodyKeys = ['body', 'text_body', 'body_text', 'content', 'text', 'body_excerpt', 'snippet', 'preview', 'html_body', 'html_content', 'html']
+
+    // 第一轮：锚定匹配（最可靠，能避开一切噪声）
+    for (const key of bodyKeys) {
+      const v = mail[key]
+      if (typeof v === 'string' && v) {
+        const code = extractLabeledCode(v)
+        if (code) return code
+      }
+    }
+
+    // 第二轮：剥噪声后再取 6 位数字
+    for (const key of bodyKeys) {
+      const v = mail[key]
+      if (typeof v === 'string' && v) {
+        const code = extractCode(stripMarkupNoise(v))
+        if (code) return code
+      }
+    }
+
+    // 兜底：递归拼接对象内所有字符串（同样剥噪声）
+    const blob = collectStrings(mail).join('\n')
+    return extractLabeledCode(blob) || extractCode(stripMarkupNoise(blob))
+  }
+}
+
+/**
+ * 判断一封邮件"像不像"验证码邮件（用于排序优先级，不作为硬过滤）。
+ * 实测 AWS Builder ID 验证码邮件：from 含 `no-reply@signin.aws`（被 iCloud 隐藏邮件改写成
+ * `no-reply_at_signin_aws_xxx@icloud.com`），主题 `Verify your AWS Builder ID email address`。
+ */
+function looksLikeOtpMail(mail: Record<string, unknown>): boolean {
+  const from = String(mail.from ?? mail.from_email ?? mail.from_address ?? '').toLowerCase()
+  const subject = String(mail.subject ?? '').toLowerCase()
+  if (/signin[_.]?aws|no-reply.*signin/.test(from)) return true
+  return /verify|verification|一次性|验证码|校验码/.test(subject)
+}
+
+/**
+ * 剥掉容易产生"假验证码"的标记噪声，供 6 位数字兜底匹配前预处理。
+ *
+ * 实测噪声来源（AWS 通知类 HTML 邮件）：
+ *  - awstrack.me 追踪链接：`.../010001a0724239ac-...-000000/Jao0OF...=473`  → 假码 000000
+ *  - CSS 十六进制颜色：`color: #555555;`                                    → 假码 555555
+ */
+function stripMarkupNoise(input: string): string {
+  return input
+    // URL（http/https 或 //host/... 形式）
+    .replace(/\bhttps?:\/\/\S+/gi, ' ')
+    .replace(/\bhref\s*=\s*["'][^"']*["']/gi, ' ')
+    .replace(/\bsrc\s*=\s*["'][^"']*["']/gi, ' ')
+    // style 属性与十六进制颜色
+    .replace(/\bstyle\s*=\s*["'][^"']*["']/gi, ' ')
+    .replace(/#[0-9a-f]{3,8}\b/gi, ' ')
+    // 剩余 HTML 标签
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&[a-z#0-9]+;/gi, ' ')
+}
+
+/**
+ * 锚定提取：在「验证码」类标签词附近找 6 位数字。
+ * AWS Builder ID 原文为 `Verification code:: 833798`；同时覆盖常见中英文写法。
+ * 标签词后允许出现冒号/空白/HTML 标签等分隔（最多 40 个非数字字符）。
+ */
+function extractLabeledCode(input: string): string {
+  const text = stripMarkupNoise(input)
+  const labels = [
+    'verification code', 'verify code', 'security code', 'confirmation code',
+    'one[- ]?time (?:pass)?code', 'otp', 'your code(?: is)?',
+    '验证码', '校验码', '动态码'
+  ]
+  for (const label of labels) {
+    const re = new RegExp(`${label}[^0-9]{0,40}?(\\d{6})\\b`, 'i')
+    const m = text.match(re)
+    if (m) return m[1]
+  }
+  return ''
+}
+
+/** 递归收集对象/数组里的所有字符串值（限制深度，避免异常结构导致栈溢出） */
+function collectStrings(value: unknown, depth = 0): string[] {
+  if (depth > 6) return []
+  if (typeof value === 'string') return [value]
+  if (Array.isArray(value)) {
+    const out: string[] = []
+    for (const item of value) out.push(...collectStrings(item, depth + 1))
+    return out
+  }
+  if (value && typeof value === 'object') {
+    const out: string[] = []
+    for (const v of Object.values(value as Record<string, unknown>)) out.push(...collectStrings(v, depth + 1))
+    return out
+  }
+  return []
+}
+
 // ============ Outlook IMAP ============
 
 export interface OutlookAccount {

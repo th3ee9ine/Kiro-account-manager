@@ -14,8 +14,14 @@ import {
 } from './http-utils'
 import {
   TempEmailService, MoEmailService, TempMailPlusService, ProtonWebviewService, GptMailService,
-  parseOutlookLines, getInboxCount, waitForOTP
+  ICloudFeedService, parseOutlookLines, parseICloudLines, getInboxCount, waitForOTP
 } from './email-service'
+import { solveAmsCaptcha } from './ams-captcha-window'
+import {
+  webVisorJWT, newVisitorUUID, postFingerprintMetricSafe, postD2CEventSafe,
+  postKatalNexusSafe, katalSignupBatch, katalVerificationBatch,
+  type TelemetryContext
+} from './telemetry'
 import { getSystemProxy, safeCreateProxyAgent } from '../proxy/systemProxy'
 import { redactString } from '../utils/redact'
 // 验活用量查询与账号管理器共用同一套 UA / 端点，避免版本号漂移导致 Builder ID 403
@@ -23,6 +29,35 @@ import { getKiroUserAgent, getKiroAmzUserAgent, qServiceEndpoint } from '../kiro
 import { KIRO_BUILDER_ID_PLACEHOLDER_ARN } from '../kiroAuthSync'
 
 export type LogFn = (message: string) => void
+
+/**
+ * 发往 AWS（signin / profile / portal）的 Accept-Language。
+ *
+ * 必须以英文为首语言：AWS WAF 会对**主语言为中文**的请求下发 challenge ——
+ * `/platform/<dir>/api/execute` 返回 `202` + 空 body + `x-amzn-waf-action: challenge`，
+ * 注册流在 WorkflowInit / SubmitEmail 直接卡死。
+ *
+ * 实测（同一出口 IP、同一 JA3 指纹，每个取值重复 3 次）：
+ *   zh-CN,zh;q=0.9,en;q=0.8  → 3/3 challenge   ← 修复前的取值
+ *   zh-CN / zh-CN,zh;q=0.9   → 3/3 challenge
+ *   en-US,en;q=0.9           → 3/3 通过 (200)
+ *   en-US,en;q=0.9,zh-CN;q=0.8 → 3/3 通过（中文可作为次语言保留）
+ *   ja-JP,ja;q=0.9           → 3/3 通过（可见并非"非英文即拦"，是专门针对中文首语言）
+ *   删除该 header            → 3/3 通过
+ *
+ * 注意：只改发往 AWS 的请求。取码源（assurivo / GPTmail 等中文站点）仍用 zh-CN，
+ * 那边不存在这条规则，改成英文反而与其站点语境不符。
+ * 另外 `i18next=zh-CN` cookie 实测无影响（AL=en-US 时带上仍 3/3 通过），故保留不动。
+ */
+const AWS_ACCEPT_LANGUAGE = 'en-US,en;q=0.9'
+
+/**
+ * SetPassword 的整体超时。
+ * 其余非幂等步骤统一 55s，但这一步可能内含 AMS 人机校验：静默通过通常几秒，
+ * 一旦脚本判定需要人工点选，就得留出真人操作时间，否则窗口刚弹出就被判超时。
+ * 与 AMS 求解自身的超时（solveAmsCaptcha 默认 120s）留出余量。
+ */
+const SET_PASSWORD_TIMEOUT = 180000
 
 export interface FingerprintSnapshot {
   chromeVer: string
@@ -51,6 +86,14 @@ export interface RegistrationResult {
   verify?: Record<string, unknown>
   /** 本次注册使用的指纹摘要（用于审计与后续复用） */
   fingerprint?: FingerprintSnapshot
+  /**
+   * 本次失败是因为 AMS 人机校验拦截。
+   *
+   * 实测：是否下发校验与出口 IP 强相关且带随机性 —— 同一账号换出口后常可直接放行
+   * （两组各 5/8 次探测里都出现过免校验的出口）。因此外层拿到这个标记时，
+   * 应当换一个出口代理重跑，而不是当成普通失败计入重试上限或直接放弃。
+   */
+  captchaBlocked?: boolean
 }
 
 type StepFn = () => Promise<void>
@@ -62,6 +105,10 @@ export type RegStepName =
   | 'portal' | 'workflow-init' | 'submit-email'
   | 'signup' | 'send-otp' | 'waiting-otp' | 'otp-received'
   | 'create-identity' | 'set-password' | 'sso-workflow' | 'sso-token'
+  // AMS 人机校验：captcha-solving 为开始求解，captcha-interactive 表示需要用户手工完成
+  | 'captcha-solving' | 'captcha-interactive'
+  // 邮箱已存在时改走验证码登录找回
+  | 'email-otp-login'
   | 'verify-alive' | 'done'
 
 export interface RegStepEvent {
@@ -101,6 +148,13 @@ export class Registrar {
   private wdcCSRFToken = ''
   private ssoToken = ''
   private outlookMailCount = 0
+  /** step6 在「邮箱已存在」时返回的 stepId，决定能否走邮箱 OTP 登录找回 */
+  private loginStepId = ''
+  // 遥测用耗时锚点：真实浏览器上报的是各阶段真实耗时，写死常量容易成为特征
+  private lastD2CFetchMs = 0
+  private profilePageStartedAt = 0
+  private profileEmailStartedAt = 0
+  private profileVerificationStartedAt = 0
 
   private log: LogFn
   private onStep: StepFn2
@@ -444,7 +498,7 @@ export class Registrar {
   private buildHeaders(referer: string, origin: string): Record<string, string> {
     const h: Record<string, string> = {
       'Accept': 'application/json, text/plain, */*',
-      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'Accept-Language': AWS_ACCEPT_LANGUAGE,
       'Accept-Encoding': 'gzip, deflate, br',
       'Content-Type': 'application/json',
       'User-Agent': this.identity.ua,
@@ -464,7 +518,7 @@ export class Registrar {
   private buildProfileHeaders(referer: string): Record<string, string> {
     const h: Record<string, string> = {
       'Accept': '*/*',
-      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'Accept-Language': AWS_ACCEPT_LANGUAGE,
       'Content-Type': 'application/json;charset=UTF-8',
       'User-Agent': this.identity.ua,
       'Origin': this.cfg.profileBase,
@@ -729,24 +783,60 @@ export class Registrar {
     }
     if (parts.length) headers['Cookie'] = parts.join('; ')
 
-    const payload: Record<string, string> = {}
-    if (this.cookies.has('awsd2c-token')) payload.token = this.cookies.get('awsd2c-token')!
+    // 真实浏览器（HAR 34/63）每次都本地生成一个自签 ES256 JWT {vid, iss:"s_p"} 提交，
+    // 并把其中的 vid 作为后续所有 api/execute 的 visitorId。
+    // 此前首次调用提交空 body（没有 awsd2c-token 时 payload 为 {}），与浏览器行为不一致，
+    // 是可被风控识别的差异点 —— 会推高 SetPassword 被下发人机校验的概率。
+    const vid = newVisitorUUID()
+    const payload: Record<string, string> = { token: webVisorJWT(vid) }
 
+    const t0 = Date.now()
     const resp = await this.doPost('https://vs.aws.amazon.com/token', payload, headers)
+    this.lastD2CFetchMs = Date.now() - t0
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     const data = this.parseBody(resp.body)
     const tok = data.token as string
     if (tok) {
       this.cookies.set('awsd2c-token', tok)
       this.cookies.set('awsd2c-token-c', tok)
-      // 从 JWT 中提取 visitor ID
-      const jwtParts = tok.split('.')
-      if (jwtParts.length >= 2) {
-        try {
-          const decoded = JSON.parse(Buffer.from(jwtParts[1], 'base64url').toString())
-          if (decoded.vid) this.vid = decoded.vid
-        } catch { /* ignore */ }
-      }
+    }
+    // visitorId 采用本地生成的 vid（与浏览器一致：后续请求复用同一 vid）
+    this.vid = vid
+  }
+
+  /** 发送已序列化的请求体（供遥测发 form-urlencoded / text-plain 用） */
+  private async doPostBody(
+    url: string,
+    body: string,
+    headers: Record<string, string>
+  ): Promise<{ body: string; status: number; headers: Record<string, string | string[]> }> {
+    return this.sendRequest('POST', url, headers, body)
+  }
+
+  /** 组装遥测所需的上下文（复用注册链路的 tls-client 通道与请求头口径） */
+  private telemetryCtx(): TelemetryContext {
+    return {
+      signinBase: this.cfg.signinBase,
+      profileBase: this.cfg.profileBase,
+      directoryId: this.cfg.directoryId,
+      ua: this.identity.ua,
+      secUA: this.secUA,
+      email: this.email,
+      workflowHandle: this.workflowHandle,
+      workflowId: this.workflowId,
+      regCode: this.regCode,
+      signState: this.signState,
+      postJson: async (url, payload, headers) => {
+        const r = await this.doPost(url, payload, headers)
+        return { status: r.status, body: r.body }
+      },
+      postRaw: async (url, body, headers) => {
+        const r = await this.doPostBody(url, body, headers)
+        return { status: r.status, body: r.body }
+      },
+      genFP: (page, eventType, inputLen, text) => this.genFP(page, eventType, inputLen, text),
+      buildHeaders: (referer, origin) => this.buildHeaders(referer, origin),
+      log: (m) => this.log(m)
     }
   }
 
@@ -906,6 +996,30 @@ export class Registrar {
       return
     }
 
+    if (this.cfg.useICloud) {
+      this.log('[3] 使用 iCloud 邮箱 (assurivo 取件)')
+      const accounts = parseICloudLines(this.cfg.icloudData)
+      if (accounts.length === 0) throw new Error('无可用的 iCloud 账号（格式应为 邮箱----查询码）')
+      // 单行 → 直接用（批量并发时前端已为每个 task 切一行，避免并发抢占）
+      // 多行（单次注册）→ 随机挑一行
+      const acc = accounts.length === 1
+        ? accounts[0]
+        : accounts[Math.floor(Math.random() * accounts.length)]
+      this.emailSvc = new ICloudFeedService({
+        baseURL: this.cfg.icloudBaseURL,
+        email: acc.email,
+        pwd: acc.pwd,
+        limit: this.cfg.icloudLimit,
+        log: (m) => this.log(m)
+      })
+      // create() 会打一次 feed.php：既校验查询码，又记录基线邮件
+      this.email = await this.emailSvc.create()
+      if (!this.email) throw new Error('iCloud 邮箱地址为空')
+      this.emitStep('email-created')
+      this.log(`email=${this.email}`)
+      return
+    }
+
     this.log('[3] 创建临时邮箱')
     if (!this.cfg.moEmailBaseURL) throw new Error('MoEmail 未配置')
     this.emailSvc = new MoEmailService(this.cfg.moEmailBaseURL, this.cfg.moEmailAPIKey)
@@ -961,6 +1075,15 @@ export class Registrar {
       requestId: rid
     }, h)
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
+
+    // 真实浏览器在此处必发（HAR entry 21）：指纹已生成
+    await postFingerprintMetricSafe(
+      this.telemetryCtx(),
+      'IsFingerprintGenerated:Success',
+      this.genFP('signin', 'first_load', 0, ''),
+      'AWSSignin:FingerprintMetrics:start'
+    )
+
     let data = this.parseBody(resp.body)
     if (data.workflowStateHandle) this.workflowHandle = data.workflowStateHandle as string
 
@@ -979,6 +1102,20 @@ export class Registrar {
       data = this.parseBody(resp.body)
       if (data.workflowStateHandle) this.workflowHandle = data.workflowStateHandle as string
     }
+
+    // HAR entry 27：指纹文件已加载
+    await postFingerprintMetricSafe(
+      this.telemetryCtx(),
+      'IsFingerprintFileLoaded:Success',
+      '1',
+      'AWSSignin:FingerprintMetrics:OnLoad_Username_Page'
+    )
+    // HAR entries 34/35/37：D2C visitor token 获取耗时（token 本身在 step4Portal 已取）
+    await postD2CEventSafe(
+      this.telemetryCtx(),
+      `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/login?workflowStateHandle=${this.workflowHandle}`,
+      this.lastD2CFetchMs
+    )
   }
 
   private async step6SubmitEmail(): Promise<'signup' | 'login'> {
@@ -1009,10 +1146,304 @@ export class Registrar {
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     const data = this.parseBody(resp.body)
     if (data.workflowStateHandle) this.workflowHandle = data.workflowStateHandle as string
+    // 已存在账号时服务端会告知该走哪种登录方式，记下来供 recoverByEmailOtp 判断
+    this.loginStepId = (data.stepId as string) || ''
 
     if (resp.status === 400) return 'signup'
     if (resp.status === 200) return 'login'
     throw new Error(`提交邮箱失败: ${resp.status} - ${resp.body.slice(0, 200)}`)
+  }
+
+  /**
+   * 邮箱 OTP 登录（找回已存在账号）。
+   *
+   * 场景：邮箱在 AWS 侧已建好身份（step6 返回 200 而非 400），此时走不了注册，
+   * 但只要我们能收这个邮箱的验证码，就能直接登录拿到 token —— 对「注册中断留下的号」
+   * 或「已注册但凭据丢失的号」都适用，等价于把它救回成可用账号。
+   *
+   * 协议（据线上 signin app.js）：
+   *   step6 返回 stepId=get-email-otp-login-credential + workflowResponseData.mfaLoginOptionsResponse
+   *   → 服务端此时**已自动发出**验证码邮件（无需我们再触发）
+   *   → 提交 {actionId:'SUBMIT', inputs:[{input_type:'EmailOTPLoginRequestInput', emailOTPLoginResponseCode:<6位>}]}
+   *   → 成功后 stepId=end-of-workflow-success + redirect.url（与注册流程 completeSignup 的产物一致）
+   * 之后即可复用 step12_8SSOWorkflow / step13SSOToken 换 token。
+   */
+
+  /**
+   * 判断某次失败是否由 AMS 人机校验造成。
+   * 外层据此改为「换出口重试」而非计入普通重试次数。
+   */
+  private isCaptchaBlocked(msg: string): boolean {
+    return /AMS captcha|人机校验|captcha 需要人工|图形验证码/.test(msg)
+  }
+
+  private async recoverByEmailOtp(): Promise<void> {
+    this.emitStep('email-otp-login')
+    this.log('[6.5] 该邮箱已存在账号，改走邮箱验证码登录找回')
+
+    // 已设好密码的账号走密码登录（本项目生成的密码是确定的，可直接用）
+    if (this.loginStepId === 'get-password') {
+      await this.loginWithPassword()
+      return
+    }
+
+    if (this.loginStepId !== 'get-email-otp-login-credential') {
+      throw new Error(
+        `该邮箱已注册过，且当前登录方式不是邮箱验证码（stepId=${this.loginStepId || '未知'}），无法自动找回`
+      )
+    }
+    if (!this.emailSvc) {
+      throw new Error('该邮箱已注册过；自动找回需要可取码的邮箱源（Outlook 模式暂不支持找回）')
+    }
+
+    // step6 的响应即代表验证码已发出，直接轮询取码
+    this.log('[6.5] 等待登录验证码…')
+    const otp = await this.emailSvc.waitForCode(180, 5, this.abortController.signal)
+    this.log(`[6.5] 登录验证码: ${otp}`)
+
+    const api = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/api/execute`
+    const ref = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/login?workflowStateHandle=${this.workflowHandle}`
+    const fp = this.genFP('signin', 'PageSubmit', otp.length, otp)
+    const rid = newUUID()
+    const h = this.buildHeaders(ref, this.cfg.signinBase)
+    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+
+    const resp = await this.doPost(api, {
+      stepId: 'get-email-otp-login-credential',
+      workflowStateHandle: this.workflowHandle,
+      actionId: 'SUBMIT',
+      inputs: [
+        { input_type: 'EmailOTPLoginRequestInput', emailOTPLoginResponseCode: otp },
+        { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
+      ],
+      visitorId: this.vid, requestId: rid
+    }, h)
+    saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
+    const data = this.parseBody(resp.body)
+
+    if (data.workflowStateHandle) this.workflowHandle = data.workflowStateHandle as string
+
+    // 登录环节同样可能被要求人机校验
+    const captchaRequest = await this.resolveCaptcha(data)
+    if (captchaRequest) {
+      const rid2 = newUUID()
+      const h2 = this.buildHeaders(ref, this.cfg.signinBase)
+      h2['x-amzn-requestid'] = rid2; h2['x-amz-date'] = gmtDate(); h2['priority'] = 'u=1, i'
+      const retry = await this.doPost(api, {
+        stepId: 'get-email-otp-login-credential',
+        workflowStateHandle: this.workflowHandle,
+        actionId: 'SUBMIT',
+        inputs: [
+          { input_type: 'EmailOTPLoginRequestInput', emailOTPLoginResponseCode: otp },
+          { input_type: 'FingerPrintRequestInput', fingerPrint: this.genFP('signin', 'PageSubmit', otp.length, otp) }
+        ],
+        captchaRequest,
+        visitorId: this.vid, requestId: rid2
+      }, h2)
+      saveCookies(this.cookies, retry.headers as Record<string, string | string[] | undefined>)
+      Object.assign(data, this.parseBody(retry.body))
+    }
+
+    const redir = data.redirect as Record<string, unknown> | undefined
+    const rurl = (redir?.url as string) || ''
+
+    // 情形 A：该账号注册时中断在「未设密码」，服务端要求先补设密码再继续。
+    // redirect 指向 /signup?workflowStateHandle=...，与注册流程 12a 的入口同构，
+    // 因此换上这个 handle 直接复用 step12SetPassword 即可（它内部也会处理人机校验）。
+    if (data.stepId === 'resume-signup-create-password') {
+      this.log('[6.5] 该账号未设置密码，先补设密码')
+      const wh = extractParam(rurl, 'workflowStateHandle')
+      if (!wh) throw new Error('resume-signup 未返回 workflowStateHandle')
+      this.workflowHandle = wh
+      // step12a 用 registrationCode+state 换公钥；续注册路径没有这两者，
+      // 改用 workflowStateHandle 直接进入「设置新密码」步骤。
+      await this.step12SetPasswordResume()
+      return
+    }
+
+    // 情形 B：账号完整，OTP 登录直接成功
+    if (data.stepId !== 'end-of-workflow-success') {
+      throw new Error(`邮箱验证码登录失败: stepId=${data.stepId || '未知'} ${this.formatErrorBody(resp.body, resp.status)}`)
+    }
+    if (!rurl) throw new Error('邮箱验证码登录未返回 redirect')
+    this.authCode = extractParam(rurl, 'workflowResultHandle')
+    this.ssoState = extractParam(rurl, 'state')
+    this.wdcCSRFToken = extractParam(rurl, 'wdc_csrf_token')
+    this.log('[6.5] 登录成功，继续换取 Token')
+  }
+
+  /**
+   * 密码登录（承接 step6 返回 stepId=get-password）。
+   *
+   * 适用于「已完整注册、密码已设好」的账号。本项目为每个账号生成的密码是已知的，
+   * 所以能直接登录换 token —— 这是最省事的找回路径，不用取码。
+   *
+   * 注意：密码由服务端下发的公钥现场加密，公钥在 step6 响应的
+   * workflowResponseData.encryptionContextResponse 里；若该响应没带公钥，
+   * 需要先推进一步拿到。
+   */
+  private async loginWithPassword(): Promise<void> {
+    this.log('[6.5] 该账号已设密码，改走密码登录')
+    // cfg.password 默认是本次随机生成的，对「历史已注册账号」而言必然不对。
+    // 只有调用方显式传入该账号当初的密码（knownPassword）才可能成功。
+    if (!this.cfg.knownPassword) {
+      throw new Error(
+        '该账号已设置密码，需提供原密码才能登录找回（配置 knownPassword）；' +
+        '若密码已丢失，只能通过 AWS 官方「忘记密码」流程重置'
+      )
+    }
+    const api = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/api/execute`
+    const ref = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/login?workflowStateHandle=${this.workflowHandle}`
+
+    // 取加密公钥：先看 step6 的响应有没有；没有就推进一步
+    let rid = newUUID()
+    let h = this.buildHeaders(ref, this.cfg.signinBase)
+    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    let resp = await this.doPost(api, {
+      stepId: 'get-password', workflowStateHandle: this.workflowHandle,
+      inputs: [{ input_type: 'FingerPrintRequestInput', fingerPrint: this.genFP('signin', 'PageLoad', 0, '') }],
+      requestId: rid
+    }, h)
+    saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
+    let data = this.parseBody(resp.body)
+    if (data.workflowStateHandle) this.workflowHandle = data.workflowStateHandle as string
+
+    const encCtx = getNestedMap(data as Record<string, unknown>, 'workflowResponseData', 'encryptionContextResponse')
+    const pubKeyMap = encCtx ? getNestedStringMap(encCtx, 'publicKey') : null
+    if (!pubKeyMap?.n) {
+      throw new Error(`密码登录未获取到加密公钥: ${this.formatErrorBody(resp.body, resp.status)}`)
+    }
+    const encrypted = encryptPassword(
+      this.cfg.knownPassword,
+      pubKeyMap,
+      (encCtx?.issuer as string) || 'signin',
+      (encCtx?.audience as string) || 'AWSPasswordService',
+      (encCtx?.region as string) || 'us-east-1'
+    )
+
+    const captchaRequest = await this.resolveCaptcha(data)
+
+    rid = newUUID()
+    h = this.buildHeaders(ref, this.cfg.signinBase)
+    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+    const payload: Record<string, unknown> = {
+      stepId: 'get-password', workflowStateHandle: this.workflowHandle, actionId: 'SUBMIT',
+      inputs: [
+        { input_type: 'PasswordRequestInput', password: encrypted, successfullyEncrypted: 'SUCCESSFUL' },
+        { input_type: 'UserPreferencesRequestInput', trustDevice: false },
+        { input_type: 'FingerPrintRequestInput', fingerPrint: this.genFP('signin', 'PageSubmit', 0, '') }
+      ],
+      visitorId: this.vid, requestId: rid
+    }
+    if (captchaRequest) payload.captchaRequest = captchaRequest
+
+    resp = await this.doPost(api, payload, h)
+    saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
+    data = this.parseBody(resp.body)
+
+    if (data.stepId !== 'end-of-workflow-success') {
+      throw new Error(`密码登录失败: stepId=${data.stepId || '未知'} ${this.formatErrorBody(resp.body, resp.status)}`)
+    }
+    const redir = data.redirect as Record<string, unknown> | undefined
+    const rurl = (redir?.url as string) || ''
+    if (!rurl) throw new Error('密码登录未返回 redirect')
+    this.authCode = extractParam(rurl, 'workflowResultHandle')
+    this.ssoState = extractParam(rurl, 'state')
+    this.wdcCSRFToken = extractParam(rurl, 'wdc_csrf_token')
+    this.log('[6.5] 密码登录成功，继续换取 Token')
+  }
+
+  /**
+   * 续注册补设密码（承接 resume-signup-create-password）。
+   *
+   * 与 step12SetPassword 的差别：那条路径来自新注册，用 registrationCode + signInState
+   * 换加密公钥；这里只有 workflowStateHandle，故 12a 请求体形态不同。
+   * 12b 提交密码的形态、以及人机校验的处理完全一致。
+   */
+  private async step12SetPasswordResume(): Promise<void> {
+    this.emitStep('set-password')
+    this.log('[12*] 补设密码（续注册）')
+    const api = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/signup/api/execute`
+    const ref = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/signup?workflowStateHandle=${this.workflowHandle}`
+
+    // 12a*: 用 workflowStateHandle 拿加密公钥
+    let rid = newUUID()
+    let h = this.buildHeaders(ref, this.cfg.signinBase)
+    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+
+    let resp = await this.doPost(api, {
+      stepId: '', workflowStateHandle: this.workflowHandle,
+      inputs: [{ input_type: 'FingerPrintRequestInput', fingerPrint: this.genFP('signup', 'PageSubmit', 0, '') }],
+      requestId: rid
+    }, h)
+    saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
+    let data = this.parseBody(resp.body)
+    if (data.workflowStateHandle) this.workflowHandle = data.workflowStateHandle as string
+
+    // 与新注册的 signup 工作流一致：首次请求只回 stepId="start"，
+    // 需再推进一步（actionId 缺省）服务端才下发 encryptionContextResponse。
+    if (data.stepId === 'start') {
+      rid = newUUID()
+      h = this.buildHeaders(ref, this.cfg.signinBase)
+      h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+      resp = await this.doPost(api, {
+        stepId: 'start', workflowStateHandle: this.workflowHandle,
+        inputs: [
+          { input_type: 'UserRequestInput', username: this.email },
+          { input_type: 'FingerPrintRequestInput', fingerPrint: this.genFP('signup', 'PageSubmit', 0, '') }
+        ],
+        requestId: rid
+      }, h)
+      saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
+      data = this.parseBody(resp.body)
+      if (data.workflowStateHandle) this.workflowHandle = data.workflowStateHandle as string
+    }
+
+    const encCtx = getNestedMap(data as Record<string, unknown>, 'workflowResponseData', 'encryptionContextResponse')
+    const pubKeyMap = encCtx ? getNestedStringMap(encCtx, 'publicKey') : null
+    if (!pubKeyMap?.n) {
+      throw new Error(`续注册未获取到加密公钥: stepId=${data.stepId} ${this.formatErrorBody(resp.body, resp.status)}`)
+    }
+    const encrypted = encryptPassword(
+      this.cfg.password,
+      pubKeyMap,
+      (encCtx?.issuer as string) || 'signin',
+      (encCtx?.audience as string) || 'AWSPasswordService',
+      (encCtx?.region as string) || 'us-east-1'
+    )
+
+    const captchaRequest = await this.resolveCaptcha(data)
+
+    // 12b*: 提交密码（与新注册同形）
+    rid = newUUID()
+    h = this.buildHeaders(ref, this.cfg.signinBase)
+    h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
+
+    const payload: Record<string, unknown> = {
+      stepId: (data.stepId as string) || 'get-new-password-for-password-creation',
+      workflowStateHandle: this.workflowHandle, actionId: 'SUBMIT',
+      inputs: [
+        { input_type: 'PasswordRequestInput', password: encrypted, successfullyEncrypted: 'SUCCESSFUL' },
+        { input_type: 'UserRequestInput', username: this.email },
+        { input_type: 'FingerPrintRequestInput', fingerPrint: this.genFP('signup', 'PageSubmit', 0, '') }
+      ],
+      visitorId: this.vid, requestId: rid
+    }
+    if (captchaRequest) payload.captchaRequest = captchaRequest
+
+    resp = await this.doPost(api, payload, h)
+    saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
+    data = this.parseBody(resp.body)
+
+    const redir2 = data.redirect as Record<string, unknown> | undefined
+    const rurl2 = (redir2?.url as string) || ''
+    if (!rurl2) throw new Error(`续注册设置密码未返回 redirect: ${this.formatErrorBody(resp.body, resp.status)}`)
+
+    await this.completeSignup(
+      extractParam(rurl2, 'workflowStateHandle'),
+      extractParam(rurl2, 'state'),
+      extractParam(rurl2, 'workflowResultHandle')
+    )
   }
 
   private async step7Signup(): Promise<void> {
@@ -1101,13 +1532,31 @@ export class Registrar {
     if (!this.cookies.has('awsccc')) this.cookies.set('awsccc', awsccc())
 
     const url = `${this.cfg.profileBase}/?workflowID=${this.workflowId}`
-    const resp = await this.doGet(url, {
+    // 这是加载 Profile 应用的文档请求。真实浏览器在这一跳同样会带上当前 AWS cookie，
+    // 带着它们能让随后的 FWCIM 指纹与 D2C token 状态归属同一个会话；
+    // 此前只发了三个 header、完全不带 cookie，是会话割裂的自动化特征。
+    const navHeaders: Record<string, string> = {
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': AWS_ACCEPT_LANGUAGE,
       'User-Agent': this.identity.ua,
-      'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate'
-    })
+      'sec-ch-ua': this.secUA,
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'sec-fetch-dest': 'document',
+      'sec-fetch-mode': 'navigate',
+      'sec-fetch-site': 'cross-site',
+      'Upgrade-Insecure-Requests': '1'
+    }
+    const navCookie = ['awsccc', 'aws-user-profile-ubid', 'awsd2c-token', 'awsd2c-token-c', 'i18next']
+      .filter((k) => (this.cookies.get(k) || '').trim())
+      .map((k) => `${k}=${this.cookies.get(k)}`)
+      .join('; ')
+    if (navCookie) navHeaders['Cookie'] = navCookie
+
+    const resp = await this.doGet(url, navHeaders)
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     resetPerfTiming(this.fpCtx)
+    this.profilePageStartedAt = Date.now()
     await this.fetchD2CToken(this.cfg.profileBase, url)
   }
 
@@ -1131,6 +1580,14 @@ export class Registrar {
     const data = this.parseBody(resp.body)
     this.workflowState = (data.workflowState as string) || ''
     if (!this.workflowState) throw new Error(`Profile start 未返回 workflowState: ${resp.body.slice(0, 200)}`)
+    this.profileEmailStartedAt = Date.now()
+
+    // HAR entry 66：profile 页的 D2C 耗时遥测
+    await postD2CEventSafe(
+      this.telemetryCtx(),
+      `${this.cfg.profileBase}/?workflowID=${this.workflowId}#/signup/start?workflowID=${this.workflowId}`,
+      this.lastD2CFetchMs
+    )
   }
 
   private async step9SendOTP(): Promise<void> {
@@ -1171,7 +1628,14 @@ export class Registrar {
 
     const resp = await this.doPost(this.cfg.profileBase + '/api/send-otp', payload, this.buildProfileHeaders(ref))
     if (resp.status !== 200) throw new Error(`send-otp 失败 (${resp.status}), body: ${resp.body.substring(0, 300)}`)
+    this.profileVerificationStartedAt = Date.now()
     this.log('验证码已发送')
+
+    // HAR entry 69：SendOTP 完成后浏览器必发的 katal 批次。
+    // 上报真实阶段耗时；锚点缺失时用 HAR 里的典型值兜底（避免出现 0 这种不真实的值）。
+    const getConfigMs = this.elapsedSince(this.profilePageStartedAt) || 577
+    const sendOTPMs = this.elapsedSince(this.profileEmailStartedAt) || 672
+    await postKatalNexusSafe(this.telemetryCtx(), katalSignupBatch(getConfigMs, sendOTPMs))
   }
 
   private async step10GetOTP(): Promise<string> {
@@ -1187,6 +1651,9 @@ export class Registrar {
       return await waitForOTP(acc, this.outlookMailCount, 120, 5, signal)
     }
     if (!this.emailSvc) throw new Error('邮箱服务未初始化')
+    // iCloud 走 Apple 侧投递 + 站点侧抓取两跳，到站比临时邮箱慢；
+    // 放宽到 180s 并把间隔拉到 5s，避免对 feed.php 打太密。
+    if (this.cfg.useICloud) return await this.emailSvc.waitForCode(180, 5, signal)
     return await this.emailSvc.waitForCode(120, 3, signal)
   }
 
@@ -1215,6 +1682,18 @@ export class Registrar {
     this.regCode = (data.registrationCode as string) || ''
     this.signState = (data.signInState as string) || ''
     if (!this.regCode) throw new Error(`create-identity 未返回 registrationCode: ${resp.body.slice(0, 200)}`)
+
+    // HAR entry 72：CreateIdentity 完成后浏览器必发的 katal 批次
+    const verificationMs = this.elapsedSince(this.profileVerificationStartedAt) || 15539
+    const createIdentityMs = this.elapsedSince(this.profileEmailStartedAt) || 603
+    await postKatalNexusSafe(this.telemetryCtx(), katalVerificationBatch(verificationMs, createIdentityMs))
+  }
+
+  /** 距锚点的毫秒数；锚点未设置或时钟异常时返回 0（由调用方用 HAR 典型值兜底） */
+  private elapsedSince(anchor: number): number {
+    if (!anchor) return 0
+    const d = Date.now() - anchor
+    return d > 0 ? d : 0
   }
 
   private async step12SetPassword(): Promise<void> {
@@ -1251,13 +1730,18 @@ export class Registrar {
 
     const encrypted = encryptPassword(this.cfg.password, pubKeyMap, issuer, audience, region)
 
+    // 12a 的响应可能带人机校验要求：只要 captchaToken 非空，12b 就**必须**回传过关凭证，
+    // 否则服务端返回 400 + AUTHENTICATION_FAILED（文案伪装成 "unexpected error"，
+    // 且重试会升级为 AWS-RISK-CONTROL）。详见 ams-captcha-window.ts 顶部说明。
+    const captchaRequest = await this.resolveCaptcha(data)
+
     // 12b: 提交密码
     fp = this.genFP('signup', 'PageSubmit', 0, '')
     rid = newUUID()
     h = this.buildHeaders(ref, this.cfg.signinBase)
     h['x-amzn-requestid'] = rid; h['x-amz-date'] = gmtDate(); h['priority'] = 'u=1, i'
 
-    resp = await this.doPost(api, {
+    const submitPayload: Record<string, unknown> = {
       stepId: 'get-new-password-for-password-creation',
       workflowStateHandle: this.workflowHandle, actionId: 'SUBMIT',
       inputs: [
@@ -1266,7 +1750,11 @@ export class Registrar {
         { input_type: 'FingerPrintRequestInput', fingerPrint: fp }
       ],
       visitorId: this.vid, requestId: rid
-    }, h)
+    }
+    // 与官方前端一致：captchaRequest 是**顶层字段**，不是 inputs 里的一项
+    if (captchaRequest) submitPayload.captchaRequest = captchaRequest
+
+    resp = await this.doPost(api, submitPayload, h)
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     data = this.parseBody(resp.body)
 
@@ -1278,6 +1766,63 @@ export class Registrar {
     const st = extractParam(rurl, 'state')
     const rh = extractParam(rurl, 'workflowResultHandle')
     await this.completeSignup(wh, st, rh)
+  }
+
+  /**
+   * 解析服务端下发的人机校验要求，返回要挂在请求顶层的 captchaRequest（无需校验时返回 null）。
+   *
+   * 两类（据线上 signin app.js 的 AMSCaptcha 组件）：
+   *   - AMS：captchaToken + captchaCDN → 借隐藏窗口跑官方 CDN 脚本拿 accessCode，可自动化
+   *   - ACS：仅 captchaURL           → 传统图形题，需人工识图，当前不支持，抛出明确错误
+   */
+  private async resolveCaptcha(data: Record<string, unknown>): Promise<Record<string, unknown> | null> {
+    const cap = data.captchaResponse as Record<string, unknown> | undefined
+    if (!cap) return null
+
+    const token = typeof cap.captchaToken === 'string' ? cap.captchaToken : ''
+    const cdn = typeof cap.captchaCDN === 'string' ? cap.captchaCDN : ''
+    const url = typeof cap.captchaURL === 'string' ? cap.captchaURL : ''
+    const ces = typeof cap.captchaCES === 'string' ? cap.captchaCES : ''
+
+    if (token && cdn) {
+      this.log('[12a] 服务端要求人机校验 (AMS)，启动求解…')
+      this.emitStep('captcha-solving')
+      const solved = await solveAmsCaptcha({
+        captchaToken: token,
+        captchaCDN: cdn,
+        // 需要人工点选时向上冒泡，让前端能提示用户（批量场景否则会静默卡住）
+        onInteractive: () => {
+          this.log(
+            this.cfg.captchaUnattended
+              ? '[12a] 人机校验需要人工完成，无人值守模式下跳过本次'
+              : '[12a] 人机校验需要手工完成，请在弹出的窗口内操作'
+          )
+          this.emitStep('captcha-interactive')
+        },
+        // 无人值守（批量）时不干等真人，立即失败让外层换下一个任务
+        failFastOnInteractive: this.cfg.captchaUnattended === true,
+        // 必须与注册链路同出口：凭证核验绑定来源 IP。
+        // 注意这里要的是「实际连接端点」而非审计用的目标代理：启用代理链时
+        // cfg.proxy 是本地中继地址，窗口必须连中继才能复用同一出口。
+        proxy: this.captchaWindowProxy(),
+        log: (m) => this.log(m),
+        signal: this.abortController.signal
+      })
+      const req: Record<string, unknown> = { captchaAccessCode: solved.accessCode }
+      // CES 若下发则一并回传（官方前端在 ACS/AMS 混合场景会同时带）
+      if (ces) req.captchaCES = ces
+      return req
+    }
+
+    if (url) {
+      throw new Error(
+        'AWS 要求图形验证码 (ACS)，当前不支持自动识别。建议：更换出口代理后重试，' +
+        '或降低注册频率/启用限速以避免触发风控'
+      )
+    }
+
+    // 有 captchaResponse 但三个字段都空 → 无需校验（实测正常流程也会带这种空壳）
+    return null
   }
 
   private async completeSignup(wh: string, state: string, rh: string): Promise<void> {
@@ -1588,7 +2133,7 @@ export class Registrar {
           if (s.retry) await this.retryStep(s.name, s.fn, s.retry, { timeoutMs: s.timeoutMs, refreshSession: s.refreshSession })
           else await s.fn()
         } catch (err) {
-          return { status: 'failed', email: this.email, error: `[${s.name}] ${(err as Error).message}` }
+          return { status: 'failed', email: this.email, error: `[${s.name}] ${(err as Error).message}`, captchaBlocked: this.isCaptchaBlocked((err as Error).message) }
         }
         await this.humanDelay()
       }
@@ -1609,7 +2154,7 @@ export class Registrar {
         for (const s of signupSteps) {
           this.checkAborted()
           try { await this.withTimeout(s.fn(), STEP_TIMEOUT, s.name) } catch (err) {
-            return { status: 'failed', email: this.email, error: `[${s.name}] ${(err as Error).message}` }
+            return { status: 'failed', email: this.email, error: `[${s.name}] ${(err as Error).message}`, captchaBlocked: this.isCaptchaBlocked((err as Error).message) }
           }
           await this.humanDelay()
         }
@@ -1621,17 +2166,28 @@ export class Registrar {
         }
 
         for (const s of [
-          { name: 'CreateIdentity', fn: () => this.step11CreateIdentity(otp) },
-          { name: 'SetPassword', fn: () => this.step12SetPassword() }
-        ] as Array<{ name: string; fn: StepFn }>) {
+          { name: 'CreateIdentity', fn: () => this.step11CreateIdentity(otp), timeoutMs: STEP_TIMEOUT },
+          // SetPassword 可能内含 AMS 人机校验：静默通过只要几秒，但脚本判定需要人工点选时
+          // 得留出真人操作时间，55s 会把窗口刚弹出来的注册直接判超时。
+          { name: 'SetPassword', fn: () => this.step12SetPassword(), timeoutMs: SET_PASSWORD_TIMEOUT }
+        ] as Array<{ name: string; fn: StepFn; timeoutMs: number }>) {
           this.checkAborted()
-          try { await this.withTimeout(s.fn(), STEP_TIMEOUT, s.name) } catch (err) {
-            return { status: 'failed', email: this.email, error: `[${s.name}] ${(err as Error).message}` }
+          try { await this.withTimeout(s.fn(), s.timeoutMs, s.name) } catch (err) {
+            return { status: 'failed', email: this.email, error: `[${s.name}] ${(err as Error).message}`, captchaBlocked: this.isCaptchaBlocked((err as Error).message) }
           }
           await this.humanDelay()
         }
       } else {
-        return { status: 'failed', email: this.email, error: '该邮箱已注册过' }
+        // 邮箱在 AWS 侧已有账号：注册走不通，但只要能收这个邮箱的验证码就能登录找回，
+        // 拿到的 token 与新注册等价。默认开启（recoverExisting 未显式关闭时）。
+        if (this.cfg.recoverExisting === false) {
+          return { status: 'failed', email: this.email, error: '该邮箱已注册过' }
+        }
+        try {
+          await this.withTimeout(this.recoverByEmailOtp(), 240000, 'EmailOtpLogin')
+        } catch (err) {
+          return { status: 'failed', email: this.email, error: `[EmailOtpLogin] ${(err as Error).message}`, captchaBlocked: this.isCaptchaBlocked((err as Error).message) }
+        }
       }
 
       // ====== 后期步骤（SSO + Token）======
@@ -1685,6 +2241,24 @@ export class Registrar {
     } finally {
       await this.cleanup()
     }
+  }
+
+  /**
+   * captcha 窗口应连接的代理端点。
+   *
+   * 与 resolvedProxyUrl() 的区别：后者是**审计用**，代理链启用时返回真正的目标代理；
+   * 这里要的是**实际连接端点** —— 启用代理链时必须连本地中继（cfg.proxy），
+   * 这样窗口流量才和注册请求走同一条链、同一出口 IP。
+   * AMS 凭证的签发与核验绑定来源 IP，出口不一致会被判为另一个访客。
+   */
+  private captchaWindowProxy(): string | undefined {
+    const p = (this.cfg.proxy || '').trim()
+    if (p) return p
+    return (
+      process.env.HTTPS_PROXY || process.env.https_proxy ||
+      process.env.HTTP_PROXY || process.env.http_proxy ||
+      getSystemProxy() || undefined
+    )
   }
 
   /**
@@ -1763,7 +2337,8 @@ export class Registrar {
     try {
       // 非幂等步骤加整体超时看门狗，卡住时快速失败
       await this.withTimeout(this.step11CreateIdentity(otp), 55000, 'CreateIdentity')
-      await this.withTimeout(this.step12SetPassword(), 55000, 'SetPassword')
+      // 同自动模式：这一步可能内含需人工完成的 AMS 人机校验，不能用 55s 通用超时
+      await this.withTimeout(this.step12SetPassword(), SET_PASSWORD_TIMEOUT, 'SetPassword')
 
       // SSO + Token：账号已创建，网络波动时在同一 Registrar 内重试（复用已有注册状态），避免白费已完成的注册
       let awsToken: Record<string, unknown> | null = null

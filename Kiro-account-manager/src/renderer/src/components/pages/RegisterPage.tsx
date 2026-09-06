@@ -181,8 +181,30 @@ function injectProxySession(url: string): string {
   return url
 }
 
-type RegMode = 'manual' | 'outlook' | 'tempmail' | 'proton' | 'gptmail' | 'mixed'
-type AutoEmailSource = 'outlook' | 'tempmail' | 'proton' | 'gptmail'
+type RegMode = 'manual' | 'outlook' | 'tempmail' | 'proton' | 'gptmail' | 'icloud' | 'mixed'
+type AutoEmailSource = 'outlook' | 'tempmail' | 'proton' | 'gptmail' | 'icloud'
+
+const AUTO_EMAIL_SOURCES: AutoEmailSource[] = ['outlook', 'tempmail', 'proton', 'gptmail', 'icloud']
+
+/** 过滤 localStorage / 模板里的历史脏数据（如已废弃的 moemail），只保留当前支持的源 */
+function isAutoEmailSource(value: string): value is AutoEmailSource {
+  return (AUTO_EMAIL_SOURCES as string[]).includes(value)
+}
+
+/** 各邮箱源在日志 / 任务中心 / Webhook 里的展示名 */
+const SOURCE_LABELS: Record<AutoEmailSource, string> = {
+  outlook: 'Outlook',
+  tempmail: 'TempMail.Plus',
+  proton: 'Proton',
+  gptmail: 'GPTmail',
+  icloud: 'iCloud'
+}
+
+function modeLabel(m: RegMode, isEn: boolean): string {
+  if (m === 'manual') return isEn ? 'Manual' : 'Manual'
+  if (m === 'mixed') return 'Mixed'
+  return SOURCE_LABELS[m]
+}
 /**
  * Phase 状态机：
  * - idle：未开始
@@ -221,6 +243,8 @@ interface RegResult {
   provider?: string
   verify?: Record<string, unknown>
   fingerprint?: FingerprintSnapshot
+  /** 因 AWS 人机校验被拦：换出口重试通常即可通过，不应计入普通重试上限 */
+  captchaBlocked?: boolean
 }
 
 type BatchItemStatus = 'pending' | 'running' | 'retrying' | 'success' | 'failed' | 'imported' | 'import_failed'
@@ -627,6 +651,10 @@ interface RegisterConfig {
   gptMailDomain: string
   gptMailPrefix: string
   gptMailPrivatePassword: string
+  /** iCloud 取件（assurivo）— 多行 `邮箱----查询码`，与 Outlook 同为池化模式 */
+  icloudData: string
+  icloudBaseURL: string
+  icloudLimit: number
   /** 手动模式 — 母邮箱（收验证码的真实邮箱）*/
   manualParentEmail: string
   /** 手动模式 — 启用匿名邮箱（点号变体）*/
@@ -692,6 +720,11 @@ export function RegisterPage(): React.JSX.Element {
   const [gptMailDomain, setGptMailDomain] = useState(saved.gptMailDomain || '')
   const [gptMailPrefix, setGptMailPrefix] = useState(saved.gptMailPrefix || '')
   const [gptMailPrivatePassword, setGptMailPrivatePassword] = useState(saved.gptMailPrivatePassword || '')
+
+  // iCloud 取件配置（assurivo「取件链接」）：买来的 iCloud 邮箱池，一行一个 `邮箱----查询码`
+  const [icloudData, setICloudData] = useState(saved.icloudData || '')
+  const [icloudBaseURL, setICloudBaseURL] = useState(saved.icloudBaseURL || '')
+  const [icloudLimit, setICloudLimit] = useState(saved.icloudLimit ?? 10)
 
   const logContainerRef = useRef<HTMLDivElement>(null)
   const { addAccount, accounts } = useAccountsStore()
@@ -908,8 +941,7 @@ export function RegisterPage(): React.JSX.Element {
     _logs = []; setLogs([])
     setResult(null)
     setImported(false)
-    const modeLabel = mode === 'tempmail' ? 'TempMail.Plus' : mode === 'proton' ? 'Proton' : mode === 'gptmail' ? 'GPTmail' : 'Outlook'
-    addLog(t('register.logAutoStart').replace('{mode}', modeLabel))
+    addLog(t('register.logAutoStart').replace('{mode}', modeLabel(mode, isEn)))
 
     const config: Record<string, unknown> = {}
     if (mode === 'outlook') {
@@ -942,6 +974,16 @@ export function RegisterPage(): React.JSX.Element {
       config.gptMailDomain = gptMailDomain
       config.gptMailPrefix = gptMailPrefix.trim()
       config.gptMailPrivatePassword = gptMailPrivatePassword  // 私有域名设了密码才填
+    } else if (mode === 'icloud') {
+      if (!icloudData.trim()) {
+        addLog(isEn ? '[iCloud] No mailbox configured' : '[iCloud] 未配置邮箱（格式：邮箱----查询码）')
+        setPhase('idle')
+        return
+      }
+      config.useICloud = true
+      config.icloudData = icloudData
+      config.icloudBaseURL = icloudBaseURL.trim()
+      config.icloudLimit = icloudLimit
     }
 
     // 代理池注入
@@ -1123,7 +1165,7 @@ export function RegisterPage(): React.JSX.Element {
       const raw = localStorage.getItem('kiro-register-mixed-sources')
       if (raw) {
         const arr = JSON.parse(raw) as string[]
-        mixed = arr.filter((x): x is AutoEmailSource => x === 'outlook' || x === 'tempmail' || x === 'proton' || x === 'gptmail')
+        mixed = arr.filter(isAutoEmailSource)
         if (mixed.length === 0) mixed = ['outlook', 'tempmail']
       }
     } catch { /* ignore */ }
@@ -1147,11 +1189,14 @@ export function RegisterPage(): React.JSX.Element {
       gptMailDomain,
       gptMailPrefix,
       gptMailPrivatePassword,
+      icloudData,
+      icloudBaseURL,
+      icloudLimit,
       manualParentEmail: parentEmail,
       manualAnonymousEmail: anonymousEmail,
       mixedEnabledSources: mixed
     }
-  }, [mode, outlookData, fullName, batchCount, batchInterval, batchAutoImport, batchRetries, batchConcurrency, autoFetchProLink, proPlanType, tempMailEmail, tempMailEpin, tempMailDomain, protonBaseEmail, gptMailBaseURL, gptMailInboxEmail, gptMailDomain, gptMailPrefix, gptMailPrivatePassword, parentEmail, anonymousEmail])
+  }, [mode, outlookData, fullName, batchCount, batchInterval, batchAutoImport, batchRetries, batchConcurrency, autoFetchProLink, proPlanType, tempMailEmail, tempMailEpin, tempMailDomain, protonBaseEmail, gptMailBaseURL, gptMailInboxEmail, gptMailDomain, gptMailPrefix, gptMailPrivatePassword, icloudData, icloudBaseURL, icloudLimit, parentEmail, anonymousEmail])
 
   const applyTemplate = useCallback((tpl: RegisterTemplate) => {
     const c = tpl.config
@@ -1175,6 +1220,9 @@ export function RegisterPage(): React.JSX.Element {
     setGptMailDomain(c.gptMailDomain || '')
     setGptMailPrefix(c.gptMailPrefix || '')
     setGptMailPrivatePassword(c.gptMailPrivatePassword || '')
+    setICloudData(c.icloudData || '')
+    setICloudBaseURL(c.icloudBaseURL || '')
+    setICloudLimit(c.icloudLimit ?? 10)
     setParentEmail(c.manualParentEmail || '')
     setAnonymousEmail(c.manualAnonymousEmail ?? false)
     if (c.mixedEnabledSources) setMixedEnabledSources(c.mixedEnabledSources)
@@ -1348,8 +1396,8 @@ export function RegisterPage(): React.JSX.Element {
 
   // 自动保存配置到 localStorage
   useEffect(() => {
-    saveConfig({ mode, outlookData, fullName, batchCount, batchInterval, batchAutoImport, batchRetries, batchConcurrency, autoFetchProLink, proPlanType, tempMailEmail, tempMailEpin, tempMailDomain, protonBaseEmail, gptMailBaseURL, gptMailInboxEmail, gptMailDomain, gptMailPrefix, gptMailPrivatePassword, manualParentEmail: parentEmail, manualAnonymousEmail: anonymousEmail })
-  }, [mode, outlookData, fullName, batchCount, batchInterval, batchAutoImport, batchRetries, batchConcurrency, autoFetchProLink, proPlanType, tempMailEmail, tempMailEpin, tempMailDomain, protonBaseEmail, gptMailBaseURL, gptMailInboxEmail, gptMailDomain, gptMailPrefix, gptMailPrivatePassword, parentEmail, anonymousEmail])
+    saveConfig({ mode, outlookData, fullName, batchCount, batchInterval, batchAutoImport, batchRetries, batchConcurrency, autoFetchProLink, proPlanType, tempMailEmail, tempMailEpin, tempMailDomain, protonBaseEmail, gptMailBaseURL, gptMailInboxEmail, gptMailDomain, gptMailPrefix, gptMailPrivatePassword, icloudData, icloudBaseURL, icloudLimit, manualParentEmail: parentEmail, manualAnonymousEmail: anonymousEmail })
+  }, [mode, outlookData, fullName, batchCount, batchInterval, batchAutoImport, batchRetries, batchConcurrency, autoFetchProLink, proPlanType, tempMailEmail, tempMailEpin, tempMailDomain, protonBaseEmail, gptMailBaseURL, gptMailInboxEmail, gptMailDomain, gptMailPrefix, gptMailPrivatePassword, icloudData, icloudBaseURL, icloudLimit, parentEmail, anonymousEmail])
 
   // 匿名邮箱预览计算 — 以 anonymousEmail/parentEmail/accounts 为依赖实时冷算下一个变体
   const anonymousPreview = useMemo(() => {
@@ -1602,7 +1650,7 @@ export function RegisterPage(): React.JSX.Element {
       if (raw) {
         // 兼容老数据：过滤掉已废弃的 moemail
         const arr = JSON.parse(raw) as string[]
-        const valid = arr.filter((x): x is AutoEmailSource => x === 'outlook' || x === 'tempmail' || x === 'proton' || x === 'gptmail')
+        const valid = arr.filter(isAutoEmailSource)
         return valid.length > 0 ? valid : ['outlook', 'tempmail']
       }
     } catch { /* ignore */ }
@@ -1614,10 +1662,10 @@ export function RegisterPage(): React.JSX.Element {
       const raw = localStorage.getItem('kiro-register-mixed-weights')
       if (raw) {
         const parsed = JSON.parse(raw) as Record<string, number>
-        return { outlook: parsed.outlook ?? 1, tempmail: parsed.tempmail ?? 1, proton: parsed.proton ?? 1, gptmail: parsed.gptmail ?? 1 }
+        return { outlook: parsed.outlook ?? 1, tempmail: parsed.tempmail ?? 1, proton: parsed.proton ?? 1, gptmail: parsed.gptmail ?? 1, icloud: parsed.icloud ?? 1 }
       }
     } catch { /* ignore */ }
-    return { outlook: 1, tempmail: 1, proton: 1, gptmail: 1 }
+    return { outlook: 1, tempmail: 1, proton: 1, gptmail: 1, icloud: 1 }
   })
   useEffect(() => {
     try { localStorage.setItem('kiro-register-mixed-sources', JSON.stringify(mixedEnabledSources)) } catch { /* ignore */ }
@@ -1628,7 +1676,7 @@ export function RegisterPage(): React.JSX.Element {
 
   // 加权轮询调度：维护各源的"信用"分数，每次选信用最高的，扣除后累积
   // 这是 Smooth Weighted Round-Robin 算法（nginx 用的同款）
-  const mixedCredits = useRef<Record<AutoEmailSource, number>>({ outlook: 0, tempmail: 0, proton: 0, gptmail: 0 })
+  const mixedCredits = useRef<Record<AutoEmailSource, number>>({ outlook: 0, tempmail: 0, proton: 0, gptmail: 0, icloud: 0 })
 
   /** 在混合模式下按加权轮询挑选下一个有效子源 */
   const pickNextSource = useCallback((): AutoEmailSource | null => {
@@ -1639,6 +1687,7 @@ export function RegisterPage(): React.JSX.Element {
       if (src === 'proton') return !!protonBaseEmail.trim()
       // GPTmail：只要有域名就 OK（inboxEmail 留空 = 私有直收模式）
       if (src === 'gptmail') return !!gptMailDomain.trim()
+      if (src === 'icloud') return !!icloudData.trim()
       return false
     })
     if (candidates.length === 0) return null
@@ -1663,7 +1712,7 @@ export function RegisterPage(): React.JSX.Element {
       mixedCredits.current[best] -= totalWeight
     }
     return best
-  }, [mixedEnabledSources, mixedWeights, outlookData, tempMailDomain, tempMailEmail, tempMailEpin, protonBaseEmail, gptMailDomain, gptMailInboxEmail])
+  }, [mixedEnabledSources, mixedWeights, outlookData, tempMailDomain, tempMailEmail, tempMailEpin, protonBaseEmail, gptMailDomain, gptMailInboxEmail, icloudData])
 
   // 构建自动模式配置
   const buildAutoConfig = useCallback((): Parameters<typeof window.api.registrationStartAuto>[0] => {
@@ -1693,9 +1742,14 @@ export function RegisterPage(): React.JSX.Element {
       config.gptMailDomain = gptMailDomain
       config.gptMailPrefix = gptMailPrefix.trim()
       config.gptMailPrivatePassword = gptMailPrivatePassword
+    } else if (effectiveMode === 'icloud') {
+      config.useICloud = true
+      config.icloudData = icloudData
+      config.icloudBaseURL = icloudBaseURL.trim()
+      config.icloudLimit = icloudLimit
     }
     return config as Parameters<typeof window.api.registrationStartAuto>[0]
-  }, [mode, pickNextSource, outlookData, tempMailEmail, tempMailEpin, tempMailDomain, generateProtonEmail, gptMailBaseURL, gptMailInboxEmail, gptMailDomain, gptMailPrefix, gptMailPrivatePassword])
+  }, [mode, pickNextSource, outlookData, tempMailEmail, tempMailEpin, tempMailDomain, generateProtonEmail, gptMailBaseURL, gptMailInboxEmail, gptMailDomain, gptMailPrefix, gptMailPrivatePassword, icloudData, icloudBaseURL, icloudLimit])
 
   // 代理池：注册时为每个任务自动挑选一个出口代理（启用后生效）
   const { proxyPool, proxyPoolConfig, pickNextProxy, reportProxyResult } = useAccountsStore()
@@ -1706,13 +1760,27 @@ export function RegisterPage(): React.JSX.Element {
    */
   const outlookPoolRef = useRef<string[]>([])
 
+  /**
+   * iCloud 单行池：与 Outlook 同理 —— 邮箱是买来的固定地址，一个号只能注册一个账号，
+   * 所以批量启动时 shuffle 一次，每个 task 独占一行，避免并发任务撞同一个邮箱。
+   */
+  const icloudPoolRef = useRef<string[]>([])
+
   // 执行单次注册（含重试）— 每次都重新 buildAutoConfig，让 mixed 模式权重正确生效
   const runSingleWithRetry = useCallback(async (
     itemId: string,
     taskId: string,
     maxRetries: number
   ): Promise<{ success: boolean; result?: RegResult }> => {
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    /**
+     * 因人机校验被拦而额外追加的重试次数。
+     * 实测是否下发校验与出口 IP 强相关且带随机性（同一账号换出口常可直接放行），
+     * 所以这类失败不该占用普通重试配额 —— 单独给一份额度，换代理再试。
+     */
+    let captchaExtra = 0
+    const CAPTCHA_EXTRA_MAX = 6
+
+    for (let attempt = 0; attempt <= maxRetries + captchaExtra; attempt++) {
       // 暂停时阻塞等待恢复；停止时立即退出 —— 让暂停/停止对"重试"也即时生效
       while (batchPause.current && !batchAbort.current) {
         await new Promise((r) => setTimeout(r, 300))
@@ -1746,6 +1814,16 @@ export function RegisterPage(): React.JSX.Element {
         if (line) {
           enrichedConfig.outlookData = line
           addLog(`[Outlook] 分配邮箱: ${line.split('----')[0]}`)
+        }
+      }
+
+      // iCloud 模式：同上，从 shuffle 后的池里取单行独占（邮箱是买来的，撞号就废一个号）
+      // 池空时回退到完整列表（主进程 random pick，兼容兜底）
+      if (config.useICloud && icloudPoolRef.current.length > 0) {
+        const line = icloudPoolRef.current.shift()
+        if (line) {
+          enrichedConfig.icloudData = line
+          addLog(`[iCloud] 分配邮箱: ${line.split('----')[0]}`)
         }
       }
 
@@ -1787,11 +1865,17 @@ export function RegisterPage(): React.JSX.Element {
         if (regResult.status === 'success') {
           return { success: true, result: regResult }
         }
-        if (attempt === maxRetries) {
+        // 人机校验拦截：换出口再试，额度独立于普通重试
+        if (regResult.captchaBlocked && captchaExtra < CAPTCHA_EXTRA_MAX && proxyPoolConfig.enabled) {
+          captchaExtra++
+          addLog(`[Captcha] 被人机校验拦截，换出口重试 (${captchaExtra}/${CAPTCHA_EXTRA_MAX})`)
+          continue
+        }
+        if (attempt >= maxRetries + captchaExtra) {
           return { success: false, result: regResult }
         }
       } else if (!res.success) {
-        if (attempt === maxRetries) return { success: false }
+        if (attempt >= maxRetries + captchaExtra) return { success: false }
       }
     }
     return { success: false }
@@ -1945,6 +2029,25 @@ export function RegisterPage(): React.JSX.Element {
       outlookPoolRef.current = []
     }
 
+    // 初始化 iCloud 单行池 —— 仅当 icloud / mixed 启用且填了 icloudData
+    const needsICloud = mode === 'icloud' || (mode === 'mixed' && mixedEnabledSources.includes('icloud'))
+    if (needsICloud && icloudData.trim()) {
+      const lines = icloudData.split('\n').map((s) => s.trim()).filter((s) => s.includes('----'))
+      // Fisher-Yates shuffle
+      for (let i = lines.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1))
+        ;[lines[i], lines[j]] = [lines[j], lines[i]]
+      }
+      icloudPoolRef.current = lines
+      if (lines.length < totalCount) {
+        addLog(`[iCloud] 警告：邮箱池仅 ${lines.length} 个，本批 ${totalCount} 个任务，超出部分将随机复用（可能撞号）`)
+      } else {
+        addLog(`[iCloud] 邮箱池已就绪 (${lines.length} 个，shuffle 后分配)`)
+      }
+    } else {
+      icloudPoolRef.current = []
+    }
+
     setPhase('running')
 
     // 初始化限速器（如启用）
@@ -1972,7 +2075,7 @@ export function RegisterPage(): React.JSX.Element {
     const taskCenterId = taskCenter.createTask({
       kind: 'register-batch',
       title: retryItems ? `重试 ${totalCount} 个失败任务` : `批量注册 ${totalCount} 个账号`,
-      subtitle: `${mode === 'outlook' ? 'Outlook' : mode === 'tempmail' ? 'TempMail.Plus' : mode === 'proton' ? 'Proton' : mode === 'gptmail' ? 'GPTmail' : mode === 'mixed' ? 'Mixed' : 'Manual'}，并发 ${concurrency}${proxyPoolConfig.enabled ? ' + 代理池' : ''}${rateLimitEnabled ? ` + ${maxPerMinute}/分钟` : ''}`,
+      subtitle: `${modeLabel(mode, isEn)}，并发 ${concurrency}${proxyPoolConfig.enabled ? ' + 代理池' : ''}${rateLimitEnabled ? ` + ${maxPerMinute}/分钟` : ''}`,
       total: totalCount,
       onPause: () => {
         batchPause.current = true
@@ -2071,7 +2174,7 @@ export function RegisterPage(): React.JSX.Element {
       message: `共 ${totalCount} 个任务，成功 ${_batchSuccess}，失败 ${_batchFail}`,
       level: _batchFail === 0 ? 'success' : (_batchSuccess === 0 ? 'error' : 'warn'),
       fields: {
-        模式: mode === 'outlook' ? 'Outlook' : mode === 'tempmail' ? 'TempMail.Plus' : mode === 'proton' ? 'Proton' : mode === 'gptmail' ? 'GPTmail' : mode === 'mixed' ? 'Mixed' : 'Manual',
+        模式: modeLabel(mode, isEn),
         并发: concurrency,
         成功: _batchSuccess,
         失败: _batchFail,
@@ -2203,6 +2306,7 @@ export function RegisterPage(): React.JSX.Element {
               ['tempmail', t('register.tempmail')],
               ['proton', 'Proton'],
               ['gptmail', 'GPTmail'],
+              ['icloud', 'iCloud'],
               ['mixed', isEn ? 'Mixed' : '混合']
             ] as [RegMode, string][]).map(([m, label]) => (
               <button
@@ -2297,17 +2401,94 @@ export function RegisterPage(): React.JSX.Element {
             </div>
           )}
 
+          {/* iCloud 取件配置（assurivo「取件链接」）：买来的 iCloud 邮箱池，与 Outlook 同为池化模式 */}
+          {(mode === 'icloud' || (mode === 'mixed' && mixedEnabledSources.includes('icloud'))) && (() => {
+            const lines = icloudData.split('\n').map((s) => s.trim()).filter((s) => s.includes('----'))
+            return (
+              <div className="p-4 bg-muted/30 rounded-lg border border-dashed space-y-4">
+                <div className="space-y-1.5">
+                  <Label>
+                    {isEn ? 'iCloud mailboxes' : 'iCloud 邮箱'} <span className="text-destructive">*</span>
+                    <span className="ml-2 text-xs font-normal text-muted-foreground">
+                      {isEn ? '(one per line: email----query code)' : '（一行一个：邮箱----查询码）'}
+                    </span>
+                  </Label>
+                  <textarea
+                    value={icloudData}
+                    onChange={(e) => setICloudData(e.target.value)}
+                    placeholder={'name@icloud.com----查询码\nother@icloud.com----查询码'}
+                    rows={4}
+                    disabled={isRunning || batchRunning}
+                    spellCheck={false}
+                    autoComplete="off"
+                    className="w-full px-3 py-2 bg-background border rounded-lg text-sm font-mono disabled:opacity-50 resize-none"
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    {lines.length > 0
+                      ? (isEn
+                        ? `${lines.length} mailbox(es) parsed. Each batch task takes one exclusively (shuffled), so keep the pool ≥ batch size.`
+                        : `已识别 ${lines.length} 个邮箱。批量时每个任务独占一个（shuffle 后分配），建议邮箱数 ≥ 注册数量。`)
+                      : (isEn
+                        ? 'Paste the accounts you bought, same format as the assurivo pickup-link page.'
+                        : '粘贴购买到的账号，格式与 assurivo「取件链接」页面一致。')}
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="space-y-1.5">
+                    <Label>{isEn ? 'Fetch count per poll' : '单次取件封数'}</Label>
+                    <Input
+                      type="number"
+                      min={1}
+                      max={20}
+                      value={icloudLimit}
+                      onChange={(e) => {
+                        const n = parseInt(e.target.value, 10)
+                        setICloudLimit(Number.isFinite(n) ? Math.min(20, Math.max(1, n)) : 10)
+                      }}
+                      disabled={isRunning || batchRunning}
+                      className="font-mono text-xs"
+                    />
+                    <p className="text-[11px] text-muted-foreground">{isEn ? 'Site limit: 1–20, default 10' : '站点限制 1~20，默认 10'}</p>
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>{isEn ? 'Custom Base URL (optional)' : '自定义 BaseURL（可选）'}</Label>
+                    <Input
+                      value={icloudBaseURL}
+                      onChange={(e) => setICloudBaseURL(e.target.value)}
+                      placeholder="https://assurivo.com"
+                      disabled={isRunning || batchRunning}
+                      className="font-mono text-xs"
+                    />
+                    <p className="text-[11px] text-muted-foreground">{isEn ? 'Defaults to https://assurivo.com; change if the site moves domain' : '默认 https://assurivo.com，站点换域名时可改'}</p>
+                  </div>
+                </div>
+
+                <div className="p-2.5 bg-background/60 rounded border-l-2 border-primary/60 text-xs leading-relaxed text-muted-foreground space-y-1">
+                  <p className="font-medium text-foreground">{isEn ? 'How it works:' : '工作方式：'}</p>
+                  <ol className="list-decimal pl-5 space-y-0.5">
+                    <li>{isEn ? 'Buy iCloud mailboxes and paste them as email----query code' : '购买 iCloud 邮箱，按「邮箱----查询码」粘贴到上面'}</li>
+                    <li>{isEn ? 'Each mailbox is a real fixed address, used for one account only' : '每个邮箱是真实固定地址，只能注册一个账号（用完即弃）'}</li>
+                    <li>{isEn ? 'Codes are polled from /console/feed.php (JSON pickup endpoint)' : '验证码通过 /console/feed.php（JSON 取件接口）轮询获取'}</li>
+                    <li>{isEn ? 'The query code is the site-side pickup token, not an Apple ID password' : '查询码是站点侧的取件口令，不是 Apple ID 密码'}</li>
+                  </ol>
+                </div>
+              </div>
+            )
+          })()}
+
           {/* 混合模式配置：勾选要参与轮询的子源 + 权重 */}
           {mode === 'mixed' && (
             <div className="p-4 bg-muted/30 rounded-lg border border-dashed space-y-3">
               <Label>{isEn ? 'Enabled email sources (Weighted Round-Robin)' : '启用的邮箱源（加权轮询）'}</Label>
               <div className="space-y-2">
-                {(['outlook', 'tempmail', 'proton', 'gptmail'] as AutoEmailSource[]).map((src) => {
+                {AUTO_EMAIL_SOURCES.map((src) => {
                   const enabled = mixedEnabledSources.includes(src)
-                  const label = src === 'outlook' ? 'Outlook' : src === 'tempmail' ? 'TempMail.Plus' : src === 'proton' ? 'Proton' : 'GPTmail'
+                  const label = SOURCE_LABELS[src]
                   const configured = src === 'outlook' ? !!outlookData.trim()
                     : src === 'proton' ? !!protonBaseEmail.trim()
                     : src === 'gptmail' ? !!gptMailDomain.trim()
+                    : src === 'icloud' ? !!icloudData.trim()
                     : !!(tempMailDomain.trim() && tempMailEmail.trim() && tempMailEpin.trim())
                   return (
                     <div key={src} className="flex items-center gap-2">
@@ -2818,6 +2999,7 @@ export function RegisterPage(): React.JSX.Element {
                   (mode === 'tempmail' && (!tempMailDomain.trim() || !tempMailEmail.trim() || !tempMailEpin.trim())) ||
                   (mode === 'gptmail' && !gptMailDomain.trim()) ||
                   (mode === 'proton' && !protonBaseEmail.trim()) ||
+                  (mode === 'icloud' && !icloudData.trim()) ||
                   (mode === 'mixed' && pickNextSource() == null)
                 }
               >
@@ -3038,6 +3220,7 @@ export function RegisterPage(): React.JSX.Element {
                   (mode === 'tempmail' && (!tempMailDomain.trim() || !tempMailEmail.trim() || !tempMailEpin.trim())) ||
                   (mode === 'gptmail' && !gptMailDomain.trim()) ||
                   (mode === 'proton' && !protonBaseEmail.trim()) ||
+                  (mode === 'icloud' && !icloudData.trim()) ||
                   (mode === 'mixed' && pickNextSource() == null)
                 }
               >
